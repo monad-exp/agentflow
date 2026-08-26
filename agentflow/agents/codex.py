@@ -162,6 +162,7 @@ class CodexAdapter(AgentAdapter):
         if repo_instructions_ignored:
             command.extend(["--disable", "plugins"])
             command.extend(["--add-dir", paths.target_workdir])
+            prompt = self.source_checkout_prompt(prompt, paths)
         command.extend(node.extra_args)
         prompt = self._maybe_prepend_wrapper(node, prompt)
         command.append(prompt)

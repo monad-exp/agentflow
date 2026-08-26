@@ -14,48 +14,49 @@ export type BugDbScope = {
   itemId?: string;
 };
 
-const callerKey = z.string().min(1).max(256);
+const nonEmptyText = z.string().trim().min(1);
+const callerKey = nonEmptyText.max(256);
 
 export const addHuntsInput = z.object({
   hunts: z.array(
     z.object({
       callerKey,
       kind: z.nativeEnum(HuntKind),
-      objective: z.string().min(1),
-      paths: z.array(z.string().min(1)),
+      objective: nonEmptyText,
+      paths: z.array(nonEmptyText),
     }),
   ),
 });
 export const getHuntInput = z.object({});
 export const addLeadInput = z.object({
   callerKey,
-  claim: z.string().min(1),
-  locations: z.array(z.string().min(1)).min(1),
-  evidence: z.string().min(1),
-  attackerPreconditions: z.string().min(1).optional(),
-  impact: z.string().min(1).optional(),
-  validationPlan: z.string().min(1).optional(),
+  claim: nonEmptyText,
+  locations: z.array(nonEmptyText).min(1),
+  evidence: nonEmptyText,
+  attackerPreconditions: nonEmptyText.optional(),
+  impact: nonEmptyText.optional(),
+  validationPlan: nonEmptyText.optional(),
 });
 export const finishHuntInput = z.object({
   result: z.nativeEnum(HuntResult),
-  resultSummary: z.string().min(1),
+  resultSummary: nonEmptyText,
 });
 export const listHuntsAndLeadsInput = z.object({});
 export const createFindingsInput = z.object({
   findings: z.array(
     z.object({
       callerKey,
-      title: z.string().min(1),
-      rootCause: z.string().min(1),
-      impact: z.string().min(1),
-      leadIds: z.array(z.string().min(1)).min(1),
+      title: nonEmptyText,
+      rootCause: nonEmptyText,
+      impact: nonEmptyText,
+      leadIds: z.array(nonEmptyText).min(1),
     }),
   ),
 });
 export const getFindingInput = z.object({});
 export const setReviewInput = z.object({
   verdict: z.nativeEnum(FindingVerdict),
-  assessment: z.string().min(1),
+  assessment: nonEmptyText,
 });
 
 function stableId(kind: "hunt" | "lead" | "finding", scope: string, key: string): string {
@@ -65,6 +66,10 @@ function stableId(kind: "hunt" | "lead" | "finding", scope: string, key: string)
 
 function sameStrings(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function sameStringSet(left: string[], right: string[]): boolean {
+  return sameStrings([...left].sort(), [...right].sort());
 }
 
 function requireItem(scope: BugDbScope, kind: "Hunt" | "Finding"): string {
@@ -102,6 +107,9 @@ export async function addHunts(
 ) {
   const input = addHuntsInput.parse(raw);
   const ids = input.hunts.map((hunt) => stableId("hunt", scope.runId, hunt.callerKey));
+  if (new Set(ids).size !== ids.length) {
+    throw new Error("Hunt caller keys must be unique within one request");
+  }
   try {
     await prisma.$transaction(async (tx) => {
       for (const [index, hunt] of input.hunts.entries()) {
@@ -141,7 +149,7 @@ export async function getHunt(prisma: PrismaClient, scope: BugDbScope) {
   const id = requireItem(scope, "Hunt");
   const hunt = await prisma.hunt.findFirst({
     where: { id, runId: scope.runId },
-    include: { leads: { orderBy: { createdAt: "asc" } } },
+    include: { leads: { orderBy: [{ createdAt: "asc" }, { id: "asc" }] } },
   });
   if (!hunt) throw new Error("injected Hunt does not belong to this run");
   return hunt;
@@ -152,9 +160,23 @@ export async function addLead(
   scope: BugDbScope,
   raw: z.input<typeof addLeadInput>,
 ) {
-  const hunt = await getHunt(prisma, scope);
   const input = addLeadInput.parse(raw);
+  const hunt = await getHunt(prisma, scope);
   const id = stableId("lead", hunt.id, input.callerKey);
+  const replay = await prisma.lead.findUnique({ where: { id } });
+  const matchesReplay = (existing: NonNullable<typeof replay>) =>
+    existing.huntId === hunt.id &&
+    existing.claim === input.claim &&
+    sameStrings(existing.locations, input.locations) &&
+    existing.evidence === input.evidence &&
+    existing.attackerPreconditions === (input.attackerPreconditions ?? null) &&
+    existing.impact === (input.impact ?? null) &&
+    existing.validationPlan === (input.validationPlan ?? null);
+  if (replay) {
+    if (!matchesReplay(replay)) throw new Error(`idempotency conflict for Lead ${id}`);
+    return replay;
+  }
+  if (hunt.result !== null) throw new Error(`Hunt ${hunt.id} is already finished`);
   try {
     return await prisma.lead.create({
       data: {
@@ -171,16 +193,7 @@ export async function addLead(
   } catch (error) {
     if (!isUniqueConflict(error)) throw error;
     const existing = await prisma.lead.findUnique({ where: { id } });
-    if (
-      !existing ||
-      existing.huntId !== hunt.id ||
-      existing.claim !== input.claim ||
-      !sameStrings(existing.locations, input.locations) ||
-      existing.evidence !== input.evidence ||
-      existing.attackerPreconditions !== (input.attackerPreconditions ?? null) ||
-      existing.impact !== (input.impact ?? null) ||
-      existing.validationPlan !== (input.validationPlan ?? null)
-    ) {
+    if (!existing || !matchesReplay(existing)) {
       throw new Error(`idempotency conflict for Lead ${id}`);
     }
     return existing;
@@ -215,8 +228,8 @@ export async function finishHunt(
 export async function listHuntsAndLeads(prisma: PrismaClient, scope: BugDbScope) {
   return prisma.hunt.findMany({
     where: { runId: scope.runId },
-    include: { leads: { orderBy: { createdAt: "asc" } } },
-    orderBy: [{ kind: "asc" }, { createdAt: "asc" }],
+    include: { leads: { orderBy: [{ createdAt: "asc" }, { id: "asc" }] } },
+    orderBy: [{ kind: "asc" }, { createdAt: "asc" }, { id: "asc" }],
   });
 }
 
@@ -228,12 +241,14 @@ function assertSameFinding(existing: {
   title: string;
   rootCause: string;
   impact: string;
+  leads: Array<{ id: string }>;
 }, runId: string, expected: FindingAppend): void {
   if (
     existing.runId !== runId ||
     existing.title !== expected.title ||
     existing.rootCause !== expected.rootCause ||
-    existing.impact !== expected.impact
+    existing.impact !== expected.impact ||
+    !sameStringSet(existing.leads.map((lead) => lead.id), expected.leadIds)
   ) {
     throw new Error(`idempotency conflict for Finding ${existing.id}`);
   }
@@ -246,20 +261,23 @@ export async function createFindings(
 ) {
   const input = createFindingsInput.parse(raw);
   const ids = input.findings.map((finding) => stableId("finding", scope.runId, finding.callerKey));
+  if (new Set(ids).size !== ids.length) {
+    throw new Error("Finding caller keys must be unique within one request");
+  }
   const allLeadIds = input.findings.flatMap((finding) => finding.leadIds);
   if (new Set(allLeadIds).size !== allLeadIds.length) {
     throw new Error("a Lead may appear in only one Finding append");
   }
   const commit = async () => prisma.$transaction(async (tx) => {
     const leads = await tx.lead.findMany({
-      where: { id: { in: allLeadIds }, hunt: { runId: scope.runId } },
+      where: { hunt: { runId: scope.runId } },
     });
-    if (leads.length !== allLeadIds.length) {
-      throw new Error("every Lead must belong to this AgentFlow run");
+    if (!sameStringSet(leads.map((lead) => lead.id), allLeadIds)) {
+      throw new Error("Finding input must partition every Lead in this AgentFlow run exactly once");
     }
     for (const [index, finding] of input.findings.entries()) {
       const id = ids[index];
-      const existing = await tx.finding.findUnique({ where: { id } });
+      const existing = await tx.finding.findUnique({ where: { id }, include: { leads: true } });
       if (existing) assertSameFinding(existing, scope.runId, finding);
       else {
         await tx.finding.create({
@@ -280,6 +298,12 @@ export async function createFindings(
         where: { id: { in: finding.leadIds }, findingId: null },
         data: { findingId: id },
       });
+      const assigned = await tx.lead.count({
+        where: { id: { in: finding.leadIds }, findingId: id },
+      });
+      if (assigned !== finding.leadIds.length) {
+        throw new Error(`Finding ${id} did not receive its complete Lead membership`);
+      }
     }
   });
   try {
@@ -296,21 +320,39 @@ export async function createFindings(
     const finding = findings.find((item) => item.id === id);
     if (!finding) throw new Error(`Finding ${id} is missing after append`);
     assertSameFinding(finding, scope.runId, input.findings[index]);
-    if (!sameStrings(finding.leads.map((lead) => lead.id).sort(), [...input.findings[index].leadIds].sort())) {
-      throw new Error(`Finding ${id} has a different Lead membership`);
-    }
   }
   return ids.map((id) => findings.find((finding) => finding.id === id)!);
+}
+
+export function deriveDisposition(
+  triageVerdict: FindingVerdict,
+  rereviewVerdict: FindingVerdict,
+): FindingVerdict {
+  if (triageVerdict === FindingVerdict.REJECTED || rereviewVerdict === FindingVerdict.REJECTED) {
+    return FindingVerdict.REJECTED;
+  }
+  if (triageVerdict === FindingVerdict.CONFIRMED && rereviewVerdict === FindingVerdict.CONFIRMED) {
+    return FindingVerdict.CONFIRMED;
+  }
+  return FindingVerdict.INCONCLUSIVE;
 }
 
 export async function getFinding(prisma: PrismaClient, scope: BugDbScope) {
   const id = requireItem(scope, "Finding");
   const finding = await prisma.finding.findFirst({
     where: { id, runId: scope.runId },
-    include: { leads: { include: { hunt: true }, orderBy: { createdAt: "asc" } } },
+    include: {
+      leads: { include: { hunt: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
+    },
   });
   if (!finding) throw new Error("injected Finding does not belong to this run");
-  return finding;
+  if (finding.triageVerdict === null || finding.rereviewVerdict === null) {
+    return { ...finding, disposition: null };
+  }
+  return {
+    ...finding,
+    disposition: deriveDisposition(finding.triageVerdict, finding.rereviewVerdict),
+  };
 }
 
 async function setReview(

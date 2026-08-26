@@ -285,6 +285,39 @@ async def test_local_runner_env_wrapper_preserves_launch_env_when_clearing_envir
 
 
 @pytest.mark.asyncio
+async def test_local_runner_does_not_inline_connector_secrets_into_shell_wrapper(tmp_path: Path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "connector-secret-env-wrapper",
+            "agent": "codex",
+            "prompt": "hi",
+            "connector_secret_env": ["DATABASE_URL"],
+            "target": {
+                "kind": "local",
+                "shell": f"env -i PATH={os.environ.get('PATH', '/usr/bin:/bin')} bash",
+            },
+        }
+    )
+    prepared = PreparedExecution(
+        command=["python3", "-c", 'import os; print(os.getenv("DATABASE_URL", "missing"))'],
+        env={"DATABASE_URL": "postgresql://connector-secret"},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+
+    runner = LocalRunner()
+    plan = runner.plan_execution(node, prepared, _paths(tmp_path))
+    assert "DATABASE_URL" not in plan.env
+    assert "postgresql://connector-secret" not in " ".join(plan.command or [])
+
+    result = await runner.execute(node, prepared, _paths(tmp_path), _noop_output, lambda: False)
+
+    assert result.exit_code == 0
+    assert result.stdout_lines == ["missing"]
+    assert result.stderr_lines == []
+
+
+@pytest.mark.asyncio
 async def test_local_runner_inherited_kimi_bootstrap_defaults_run_in_login_interactive_shell(tmp_path: Path):
     fake_home = tmp_path / "home"
     fake_home.mkdir()

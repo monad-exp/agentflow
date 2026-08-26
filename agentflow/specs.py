@@ -431,19 +431,28 @@ class ConnectorSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_tools(self) -> "ConnectorSpec":
+        if self.command is not None and "{port}" not in self.url:
+            raise ValueError(
+                f"managed connector {self.name!r} must use a run-scoped {{port}} URL"
+            )
+        if self.command is None and "{port}" in self.url:
+            raise ValueError(
+                f"connector {self.name!r} uses {{port}} without a managed command"
+            )
+        if (
+            self.command is not None
+            and self.control_url is not None
+            and "{port}" not in self.control_url
+        ):
+            raise ValueError(
+                f"managed connector {self.name!r} must use {{port}} in control_url"
+            )
         duplicate_tools = sorted(
             name for name, count in Counter(tool.name for tool in self.tools).items() if count > 1
         )
         if duplicate_tools:
             raise ValueError(f"connector {self.name!r} has duplicate tool names: {duplicate_tools}")
         return self
-
-    def as_mcp_server(self) -> MCPServerSpec:
-        return MCPServerSpec(
-            name=self.name,
-            transport="streamable_http",
-            url=self.url,
-        )
 
 
 class ConnectorBindingSpec(BaseModel):
@@ -1759,23 +1768,11 @@ class RuntimeFanoutSpec(BaseModel):
 
 
 class DurableGoalSpec(BaseModel):
-    """Provider-neutral durable execution with native or supervised resume semantics."""
+    """Provider-neutral durable execution mode."""
 
     model_config = ConfigDict(extra="forbid")
 
     mode: Literal["native", "supervised"] = "supervised"
-    resume_instruction: str = (
-        "Resume this durable goal from the connector's persisted state. Re-read the "
-        "injected scope, preserve completed work, and retry writes with the same caller keys."
-    )
-
-    @field_validator("resume_instruction")
-    @classmethod
-    def validate_resume_instruction(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("`durable_goal.resume_instruction` must not be empty")
-        return normalized
 
 
 class NodeSpec(BaseModel):
@@ -1791,6 +1788,7 @@ class NodeSpec(BaseModel):
     tools: ToolAccess = ToolAccess.READ_ONLY
     mcps: list[MCPServerSpec] = Field(default_factory=list)
     connectors: list[str] = Field(default_factory=list)
+    connector_tools: dict[str, list[str]] = Field(default_factory=dict)
     connector_bindings: list[ConnectorBindingSpec] = Field(default_factory=list, exclude=True)
     connector_secret_env: list[str] = Field(default_factory=list, exclude=True)
     skills: list[str] = Field(default_factory=list)
@@ -1804,8 +1802,6 @@ class NodeSpec(BaseModel):
     extra_args: list[str] = Field(default_factory=list)
     description: str | None = None
     input: Any | None = None
-    input_schema: dict[str, Any] | None = None
-    output_schema: dict[str, Any] | None = None
     output_artifact: str | None = None
     concurrency_pool: str | None = None
     durable_goal: DurableGoalSpec | None = None
@@ -1816,9 +1812,9 @@ class NodeSpec(BaseModel):
     retry_backoff_strategy: Literal["linear", "exponential"] = "exponential"
     schedule: PeriodicScheduleSpec | None = None
     fanout_from: RuntimeFanoutSpec | None = None
-    fanout_group: str | None = Field(default=None, exclude=True)
-    fanout_member: dict[str, Any] | None = Field(default=None, exclude=True)
-    fanout_dependencies: dict[str, list[str]] = Field(default_factory=dict, exclude=True)
+    fanout_group: str | None = None
+    fanout_member: dict[str, Any] | None = None
+    fanout_dependencies: dict[str, list[str]] = Field(default_factory=dict)
 
     @field_validator("agent")
     @classmethod
@@ -1835,6 +1831,16 @@ class NodeSpec(BaseModel):
         self.depends_on = list(dict.fromkeys(self.depends_on))
         self.connectors = list(dict.fromkeys(self.connectors))
         self.connector_secret_env = list(dict.fromkeys(self.connector_secret_env))
+        normalized_connector_tools: dict[str, list[str]] = {}
+        for raw_connector, raw_tools in self.connector_tools.items():
+            connector = raw_connector.strip()
+            if not connector or connector not in self.connectors:
+                raise ValueError("`connector_tools` keys must name a connector declared on the node")
+            tools = [tool.strip() for tool in raw_tools]
+            if any(not tool for tool in tools):
+                raise ValueError("`connector_tools` entries must not be empty")
+            normalized_connector_tools[connector] = list(dict.fromkeys(tools))
+        self.connector_tools = normalized_connector_tools
         duplicate_mcp_names = sorted(name for name, count in Counter(mcp.name for mcp in self.mcps).items() if count > 1)
         if duplicate_mcp_names:
             raise ValueError(f"duplicate MCP server names on node {self.id!r}: {duplicate_mcp_names}")
@@ -1845,10 +1851,6 @@ class NodeSpec(BaseModel):
                 raise ValueError("scheduled nodes currently require a local target")
         if self.fanout_from is not None and self.on_failure_restart:
             raise ValueError("runtime fan-out templates cannot be cycle tails")
-        if self.input_schema is not None:
-            check_json_schema(self.input_schema, label=f"node {self.id!r} input_schema")
-        if self.output_schema is not None:
-            check_json_schema(self.output_schema, label=f"node {self.id!r} output_schema")
         if self.concurrency_pool is not None:
             normalized_pool = self.concurrency_pool.strip()
             if not normalized_pool:
@@ -2518,14 +2520,13 @@ def apply_local_target_defaults(payload: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
-class SourceSnapshotSpec(BaseModel):
-    """Resolved repository identity persisted by AgentFlow before analysis."""
+class SourceSpec(BaseModel):
+    """Repository input that AgentFlow resolves when a run starts."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     repository_url: str = Field(alias="repositoryUrl")
     input_ref: str = Field(alias="inputRef")
-    commit_sha: str = Field(alias="commitSha")
 
     @field_validator("repository_url", "input_ref")
     @classmethod
@@ -2534,6 +2535,11 @@ class SourceSnapshotSpec(BaseModel):
         if not normalized:
             raise ValueError(f"`source_snapshot.{info.field_name}` must not be empty")
         return normalized
+
+class SourceSnapshotSpec(SourceSpec):
+    """Resolved repository identity persisted before analysis."""
+
+    commit_sha: str = Field(alias="commitSha")
 
     @field_validator("commit_sha")
     @classmethod
@@ -2553,6 +2559,7 @@ class PipelineSpec(BaseModel):
     optimizer: str | None = None
     n_run: int = Field(default=1, ge=1)
     concurrency: int = Field(default=4, ge=1)
+    deadline_seconds: int | None = Field(default=None, gt=0)
     fail_fast: bool = False
     max_iterations: int = Field(default=10, ge=1)
     scratchboard: bool = False
@@ -2561,7 +2568,7 @@ class PipelineSpec(BaseModel):
     agent_defaults: dict[AgentKind, dict[str, Any]] = Field(default_factory=dict)
     local_target_defaults: LocalTarget | None = None
     inference: InferenceSetupSpec | None = None
-    source_snapshot: SourceSnapshotSpec | None = None
+    source_snapshot: SourceSpec | None = None
     connectors: list[ConnectorSpec] = Field(default_factory=list)
     concurrency_pools: dict[str, int] = Field(default_factory=dict)
     fanouts: dict[str, list[str]] = Field(default_factory=dict)
@@ -2775,6 +2782,7 @@ class RunRecord(BaseModel):
     id: str
     status: RunStatus = RunStatus.QUEUED
     pipeline: PipelineSpec
+    declared_pipeline: PipelineSpec | None = None
     optimization_parent_run_id: str | None = None
     optimization_round: int | None = Field(default=None, ge=1)
     optimization_session: dict[str, Any] | None = None

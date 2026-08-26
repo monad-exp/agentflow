@@ -11,6 +11,9 @@ join key. Runtime fan-out reads only stable Hunt/Finding IDs through the
 connector's protected control endpoint; no downstream agent consumes another
 agent's stdout or final response.
 
+The production command and production-graph fixture both use
+`build_pipeline(config)`.
+
 ## Setup and integration test
 
 Node 20+, PostgreSQL 16+, and the AgentFlow Python package are required.
@@ -45,15 +48,16 @@ The migration owns schema changes. The application role receives `SELECT`,
 assignment, triage, and re-review. Database triggers enforce insert-only
 canonical data and write-once transitions even if connector checks are bypassed.
 
-The database and end-to-end fixtures create FILE, THREAT_MODEL, and exhausted ROAM Hunts;
-merges one FILE Lead and one THREAT_MODEL Lead into one Finding; applies both
-independent reviews; verifies conflict semantics and privileges; and asserts the
-domain schema has no JSON columns. The end-to-end fixture launches the real
-TypeScript connector through AgentFlow and verifies the resulting `report.md`.
+The database and end-to-end fixtures create FILE, THREAT_MODEL, and exhausted
+ROAM Hunts; merge one FILE Lead and one THREAT_MODEL Lead into one Finding;
+apply both independent reviews; verify conflict semantics and privileges; and
+assert the domain schema has no JSON columns. The workflow fixture loads the
+real production graph with deterministic model adapters and launches the real
+TypeScript connector.
 
 ## Run one scan
 
-Check out the commit to inspect, then run one command from the repository root:
+Run one command from the AgentFlow repository root:
 
 ```bash
 export BUGFINDER_REPO_PATH=/absolute/path/to/repository
@@ -64,11 +68,16 @@ export DATABASE_URL='postgresql://agentflow_bugdb_login:agentflow_app_test@127.0
 agentflow run examples/bugfinder/pipeline.py --output summary
 ```
 
-The pipeline resolves `BUGFINDER_INPUT_REF`, requires a clean working tree whose
-`HEAD` matches it, and persists `repositoryUrl`, `inputRef`, and the full commit SHA at
-`.agentflow/runs/<run-id>/artifacts/_run/source-snapshot.json` before launching
-analysis nodes. Each report worker writes `report.md` in its own artifact
-directory.
+The pipeline resolves `BUGFINDER_INPUT_REF` at run start and creates a detached
+run-scoped worktree. It persists `repositoryUrl`,
+`inputRef`, and the full commit SHA at
+`.agentflow/runs/<run-id>/artifacts/_run/source-snapshot.json` before analysis.
+The connector uses a separate port for each run and discovers its tool schemas
+from MCP. Each stage receives only its allowed tools.
+
+After both reviews, a trusted Python node asks BugDB for the canonical Finding.
+BugDB derives disposition, and the Python node renders
+`report.md`; a model cannot select or replace disposition.
 
 Codex is the default for every role and uses the existing Codex CLI subscription
 login with `gpt-5.6-luna`. Override globally with `BUGFINDER_AGENT=claude` or
@@ -76,18 +85,8 @@ login with `gpt-5.6-luna`. Override globally with `BUGFINDER_AGENT=claude` or
 `BUGFINDER_HUNT_AGENT=pi`. Pi defaults to OpenRouter and reads
 `OPENROUTER_API_KEY`. Named provider pools bound each backend independently.
 
-Nodes use supervised durable-goal retries by default: retries re-read BugDB and
-reuse stable caller keys. Set `BUGFINDER_GOAL_MODE=native` only for an executor
-that supports a native `/goal` command. Timeout and retry policy stays in Python.
-
-For a one-model connector check, run:
-
-```bash
-agentflow run examples/bugfinder/smoke.py --output summary
-```
-
-It uses subscription-authenticated Codex with `gpt-5.6-luna` to append one
-Hunt, fan out from the durable Hunt ID, read the injected scope, and set an
-`EXHAUSTED` result. Required connector-call success criteria make the nodes
-retry if an agent returns without performing the durable write. The connector
-receives `DATABASE_URL`; local agent subprocesses do not.
+Hunt nodes use supervised durable-goal retries by default: retries re-read BugDB
+and reuse stable caller keys. Planner and deduplication nodes do not retry after
+an uncertain commit because their narrow tool surfaces cannot fully reconcile
+one. Native mode is rejected until an adapter has a tested native `/goal`
+integration. Timeout, workflow deadline, and retry policy stay in Python.

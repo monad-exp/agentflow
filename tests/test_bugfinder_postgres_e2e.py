@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import socket
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,18 +12,39 @@ from agentflow.agents.registry import AdapterRegistry
 from agentflow.orchestrator import Orchestrator
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.registry import RunnerRegistry
-from agentflow.specs import AgentKind, NodeSpec, NodeStatus, PipelineSpec
+from agentflow.specs import AgentKind, NodeSpec
 from agentflow.store import RunStore
+from examples.bugfinder.pipeline import BugfinderConfig, build_pipeline
 
 
 DATABASE_URL = os.environ.get("BUGFINDER_TEST_DATABASE_URL")
-EXAMPLE_DIR = Path(__file__).resolve().parents[1] / "examples" / "bugfinder"
+HISTORY_PATTERN = "HISTORICAL-CACHE-CROSS-MODE"
 
 
-def _available_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
+def _git(repository: Path, *args: str) -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(repository), *args],
+        text=True,
+    ).strip()
+
+
+def _fixture_repository(path: Path) -> str:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    _git(path, "config", "user.email", "fixture@example.test")
+    _git(path, "config", "user.name", "Fixture")
+    (path / "src").mkdir()
+    (path / "src" / "parser.ts").write_text(
+        "export const parser = 'fixture';\n",
+        encoding="utf-8",
+    )
+    (path / "src" / "cache.ts").write_text(
+        "export const cache = new Map();\n",
+        encoding="utf-8",
+    )
+    _git(path, "add", ".")
+    _git(path, "commit", "-qm", "fixture")
+    return _git(path, "rev-parse", "HEAD")
 
 
 class BugfinderFixtureAdapter(AgentAdapter):
@@ -37,8 +58,7 @@ import json
 import urllib.request
 
 endpoint = {endpoint!r}
-headers = {json.dumps(binding.headers)!r}
-headers = json.loads(headers)
+headers = json.loads({json.dumps(json.dumps(binding.headers))})
 headers["content-type"] = "application/json"
 
 def call(name, arguments):
@@ -49,7 +69,18 @@ def call(name, arguments):
         method="POST",
     )
     with urllib.request.urlopen(request) as response:
-        return json.loads(response.read())["result"]
+        result = json.loads(response.read())["result"]
+    print(json.dumps({{
+        "type": "item.completed",
+        "item": {{
+            "type": "mcp_tool_call",
+            "server": "bugdb",
+            "tool": name,
+            "status": "completed",
+            "error": None,
+        }},
+    }}), flush=True)
+    return result
 
 node_id = {node.id!r}
 fanout_group = {node.fanout_group!r}
@@ -63,12 +94,14 @@ if node_id == "rank_files":
         "paths": ["src/parser.ts"],
     }}]}})
 elif node_id == "threat_model":
+    objective = "Apply historical pattern {HISTORY_PATTERN} to parser/cache confusion."
     call("add_hunts", {{"hunts": [{{
         "callerKey": "threat:cross-mode-cache",
         "kind": "THREAT_MODEL",
-        "objective": "Test cross-mode parser/cache confusion.",
+        "objective": objective,
         "paths": ["src/parser.ts", "src/cache.ts"],
     }}]}})
+    text = objective
 elif node_id == "roam_plan":
     call("add_hunts", {{"hunts": [{{
         "callerKey": "roam:v1",
@@ -120,19 +153,14 @@ elif fanout_group == "rereview":
         "verdict": "CONFIRMED",
         "assessment": "Independent review confirms the mode-free cache key.",
     }})
-elif fanout_group == "report":
-    finding = call("get_finding", {{}})
-    kinds = sorted({{lead["hunt"]["kind"] for lead in finding["leads"]}})
-    text = (
-        "# " + finding["title"] + "\\n\\n"
-        "Disposition: CONFIRMED\\n\\n"
-        f"Lead count: {{len(finding['leads'])}}\\n\\n"
-        f"Hunt kinds: {{', '.join(kinds)}}\\n"
-    )
 
 print(json.dumps({{
     "type": "response.output_item.done",
-    "item": {{"type": "message", "role": "assistant", "content": [{{"type": "output_text", "text": text}}]}},
+    "item": {{
+        "type": "message",
+        "role": "assistant",
+        "content": [{{"type": "output_text", "text": text}}],
+    }},
 }}))
 '''
         relative_path = "fixture-agent.py"
@@ -147,92 +175,30 @@ print(json.dumps({{
 
 @pytest.mark.skipif(not DATABASE_URL, reason="BUGFINDER_TEST_DATABASE_URL is not set")
 @pytest.mark.asyncio
-async def test_bugfinder_postgres_end_to_end_fixture(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("BUGFINDER_TEST_DATABASE_URL", DATABASE_URL or "")
-    port = _available_port()
-    connector = {
-        "name": "bugdb",
-        "url": f"http://127.0.0.1:{port}/mcp",
-        "control_url": f"http://127.0.0.1:{port}/orchestration",
-        "command": "npm",
-        "args": ["run", "connector"],
-        "cwd": str(EXAMPLE_DIR),
-        "env": {"BUGDB_PORT": str(port)},
-        "env_from": {"DATABASE_URL": "BUGFINDER_TEST_DATABASE_URL"},
-        "tools": [
-            {"name": name, "description": name.replace("_", " "), "input_schema": {"type": "object"}}
-            for name in (
-                "add_hunts",
-                "get_hunt",
-                "add_lead",
-                "finish_hunt",
-                "list_hunts_and_leads",
-                "create_findings",
-                "get_finding",
-                "set_triage",
-                "set_rereview",
-            )
-        ],
-    }
-    common = {"agent": "codex", "connectors": ["bugdb"], "prompt": "fixture"}
-    pipeline = PipelineSpec.model_validate(
-        {
-            "name": "bugfinder-postgres-e2e",
-            "working_dir": str(tmp_path),
-            "source_snapshot": {
-                "repositoryUrl": "https://example.test/fixture.git",
-                "inputRef": "fixture",
-                "commitSha": "0123456789abcdef0123456789abcdef01234567",
+async def test_bugfinder_minimal_production_graph(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL or "")
+    repository = tmp_path / "repository"
+    commit_sha = _fixture_repository(repository)
+    pipeline = build_pipeline(
+        BugfinderConfig(
+            repository=repository,
+            repository_url="https://example.test/fixture.git",
+            input_ref="HEAD",
+            historical_context=HISTORY_PATTERN,
+            environment={
+                "BUGFINDER_AGENT": "codex",
+                "BUGFINDER_RETRIES": "0",
+                "BUGFINDER_NODE_TIMEOUT": "20",
+                "BUGFINDER_DEADLINE_SECONDS": "60",
             },
-            "concurrency": 8,
-            "fail_fast": False,
-            "connectors": [connector],
-            "nodes": [
-                {**common, "id": "rank_files"},
-                {**common, "id": "threat_model"},
-                {**common, "id": "roam_plan"},
-                {
-                    **common,
-                    "id": "hunt",
-                    "depends_on": ["rank_files", "threat_model", "roam_plan"],
-                    "fanout_from": {
-                        "from": "rank_files",
-                        "connector": "bugdb",
-                        "resource": "hunts",
-                    },
-                },
-                {**common, "id": "deduplicate", "depends_on": ["hunt"]},
-                {
-                    **common,
-                    "id": "triage",
-                    "fanout_from": {
-                        "from": "deduplicate",
-                        "connector": "bugdb",
-                        "resource": "findings",
-                    },
-                },
-                {
-                    **common,
-                    "id": "rereview",
-                    "fanout_from": {
-                        "from": "triage",
-                        "connector": "bugdb",
-                        "resource": "findings",
-                    },
-                },
-                {
-                    **common,
-                    "id": "report",
-                    "output_artifact": "report.md",
-                    "fanout_from": {
-                        "from": "rereview",
-                        "connector": "bugdb",
-                        "resource": "findings",
-                    },
-                },
-            ],
-        }
-    )
+        )
+    ).to_spec()
+
+    assert pipeline.connectors[0].tools == []
+    assert pipeline.node_map["rank_files"].connector_tools == {"bugdb": ["add_hunts"]}
+    assert pipeline.node_map["report"].agent == AgentKind.PYTHON
+    assert all(node.repo_instructions_mode.value == "ignore" for node in pipeline.nodes)
+
     adapters = AdapterRegistry()
     adapters.register(AgentKind.CODEX, BugfinderFixtureAdapter())
     orchestrator = Orchestrator(
@@ -242,20 +208,19 @@ async def test_bugfinder_postgres_end_to_end_fixture(tmp_path: Path, monkeypatch
     )
 
     submitted = await orchestrator.submit(pipeline)
-    completed = await orchestrator.wait(submitted.id, timeout=20)
+    completed = await orchestrator.wait(submitted.id, timeout=30)
 
     assert completed.status.value == "completed"
+    assert completed.source_snapshot is not None
+    assert completed.source_snapshot.commit_sha == commit_sha
+    assert completed.nodes["rank_files"].output == "fixture complete"
+    assert HISTORY_PATTERN in (completed.nodes["threat_model"].output or "")
     assert len(completed.pipeline.fanouts["hunt"]) == 3
-    assert all(
-        completed.nodes[node_id].status == NodeStatus.COMPLETED
-        for node_id in completed.pipeline.fanouts["hunt"]
-    )
     assert len(completed.pipeline.fanouts["triage"]) == 1
     assert len(completed.pipeline.fanouts["rereview"]) == 1
     assert len(completed.pipeline.fanouts["report"]) == 1
     report_id = completed.pipeline.fanouts["report"][0]
     report = orchestrator.store.read_artifact_text(completed.id, report_id, "report.md")
-    assert "Lead count: 2" in report
-    assert "Hunt kinds: FILE, THREAT_MODEL" in report
-    assert completed.nodes["hunt"].status == NodeStatus.COMPLETED
-    assert completed.nodes["rereview"].status == NodeStatus.COMPLETED
+    assert "**Disposition:** CONFIRMED" in report
+    assert "src/parser.ts:42" in report
+    assert "src/cache.ts:17" in report

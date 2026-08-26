@@ -99,6 +99,18 @@ BEGIN
 END
 $body$;
 
+CREATE FUNCTION reject_lead_after_hunt_finish() RETURNS trigger LANGUAGE plpgsql AS $body$
+DECLARE
+    hunt_result "HuntResult";
+BEGIN
+    SELECT result INTO hunt_result FROM hunts WHERE id = NEW.hunt_id FOR UPDATE;
+    IF FOUND AND hunt_result IS NOT NULL THEN
+        RAISE EXCEPTION 'cannot append a Lead after its Hunt is finished';
+    END IF;
+    RETURN NEW;
+END
+$body$;
+
 CREATE FUNCTION enforce_finding_write_once() RETURNS trigger LANGUAGE plpgsql AS $body$
 BEGIN
     IF (NEW.id, NEW.run_id, NEW.title, NEW.root_cause, NEW.impact, NEW.created_at)
@@ -122,6 +134,8 @@ $body$;
 
 CREATE TRIGGER hunts_write_once BEFORE UPDATE ON hunts
 FOR EACH ROW EXECUTE FUNCTION enforce_hunt_write_once();
+CREATE TRIGGER leads_before_hunt_finish BEFORE INSERT ON leads
+FOR EACH ROW EXECUTE FUNCTION reject_lead_after_hunt_finish();
 CREATE TRIGGER leads_write_once BEFORE UPDATE ON leads
 FOR EACH ROW EXECUTE FUNCTION enforce_lead_write_once();
 CREATE TRIGGER findings_write_once BEFORE UPDATE ON findings
@@ -138,10 +152,13 @@ $roles$;
 REVOKE ALL ON "hunts", "leads", "findings" FROM agentflow_bugdb_app;
 GRANT USAGE ON SCHEMA public TO agentflow_bugdb_app;
 GRANT USAGE ON TYPE "HuntKind", "HuntResult", "FindingVerdict" TO agentflow_bugdb_app;
-GRANT SELECT, INSERT ON "hunts", "leads", "findings" TO agentflow_bugdb_app;
+GRANT SELECT ON "hunts", "leads", "findings" TO agentflow_bugdb_app;
+GRANT INSERT ("id", "run_id", "kind", "objective", "paths") ON "hunts" TO agentflow_bugdb_app;
+GRANT INSERT (
+    "id", "hunt_id", "claim", "locations", "evidence",
+    "attacker_preconditions", "impact", "validation_plan"
+) ON "leads" TO agentflow_bugdb_app;
+GRANT INSERT ("id", "run_id", "title", "root_cause", "impact") ON "findings" TO agentflow_bugdb_app;
 GRANT UPDATE ("result", "result_summary") ON "hunts" TO agentflow_bugdb_app;
 GRANT UPDATE ("finding_id") ON "leads" TO agentflow_bugdb_app;
 GRANT UPDATE ("triage_verdict", "triage_assessment", "rereview_verdict", "rereview_assessment") ON "findings" TO agentflow_bugdb_app;
-
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT ON TABLES TO agentflow_bugdb_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE UPDATE, DELETE, TRUNCATE ON TABLES FROM agentflow_bugdb_app;

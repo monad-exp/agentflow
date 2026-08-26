@@ -69,7 +69,10 @@ class RunStore:
         run_dir = self.run_dir(run_id)
         lock = self._locks[run_id]
         with lock:
-            (run_dir / "run.json").write_text(record.model_dump_json(indent=2), encoding="utf-8")
+            (run_dir / "run.json").write_text(
+                record.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
 
     async def append_event(self, run_id: str, event: RunEvent) -> None:
         lock = self._locks[run_id]

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 
@@ -18,44 +17,27 @@ from agentflow.specs import (
 
 def _connector_tool_completed(result: NodeResult, connector: str, tool: str) -> bool:
     aliases = {
-        tool,
         f"{connector}.{tool}",
         f"{connector}_{tool}",
         f"mcp__{connector}__{tool}",
     }
-    for event in result.trace_events:
-        raw = event.raw
-        text = " ".join(
-            part
-            for part in (
-                event.title,
-                event.content or "",
-                json.dumps(raw, ensure_ascii=False, sort_keys=True) if raw is not None else "",
+    attempt = result.current_attempt or max(
+        (event.attempt for event in result.trace_events),
+        default=1,
+    )
+    return any(
+        event.attempt == attempt
+        and event.kind == "connector_tool_completed"
+        and getattr(event, "is_error", True) is False
+        and (
+            (
+                getattr(event, "connector", None) == connector
+                and getattr(event, "tool", None) == tool
             )
-            if part
+            or getattr(event, "tool_name", None) in aliases
         )
-        if not any(alias in text for alias in aliases) or connector not in text:
-            continue
-        if isinstance(raw, dict):
-            item = raw.get("item")
-            if isinstance(item, dict) and item.get("type") == "mcp_tool_call":
-                if item.get("server") != connector or item.get("tool") != tool:
-                    continue
-                if event.kind != "item_completed":
-                    continue
-                error = item.get("error")
-                return (
-                    item.get("status") == "completed"
-                    and (error is None or error == "")
-                )
-        lowered = text.lower()
-        if event.kind in {"tool_result", "toolresult"} and "error" not in lowered:
-            return True
-        if event.kind in {"assistant_message", "message_end", "agent_end", "turn_end", "event"} and any(
-            marker in lowered for marker in ("tool_use", "tooluse", "tool_call", "toolcall")
-        ):
-            return True
-    return False
+        for event in result.trace_events
+    )
 
 
 def _read_success_text(path: Path) -> str | None:

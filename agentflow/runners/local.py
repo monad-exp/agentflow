@@ -218,6 +218,7 @@ class LocalRunner(Runner):
         command, target_env = self._command_for_target(node, prepared)
         plan_env = self._augment_local_env(prepared, paths)
         plan_env.update(target_env)
+        plan_env = self._without_connector_secrets(node, plan_env)
         command = self._inline_env_wrapper_assignments(command, plan_env)
         return LaunchPlan(
             command=command,
@@ -226,6 +227,14 @@ class LocalRunner(Runner):
             stdin=prepared.stdin,
             runtime_files=sorted(prepared.runtime_files),
         )
+
+    def _without_connector_secrets(
+        self,
+        node: NodeSpec,
+        values: dict[str, str],
+    ) -> dict[str, str]:
+        secret_names = set(node.connector_secret_env)
+        return {name: value for name, value in values.items() if name not in secret_names}
 
     def _should_suppress_stderr(self, node: NodeSpec, text: str) -> bool:
         if not target_uses_interactive_bash(node.target):
@@ -297,6 +306,7 @@ class LocalRunner(Runner):
         launch_env = self._augment_local_env(prepared, paths)
         command, target_env = self._command_for_target(node, prepared)
         launch_env.update(target_env)
+        launch_env = self._without_connector_secrets(node, launch_env)
         env = os.environ.copy()
         env.update(launch_env)
         for env_name in node.connector_secret_env:

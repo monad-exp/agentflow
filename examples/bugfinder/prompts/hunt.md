@@ -1,4 +1,4 @@
-Execute exactly the Hunt injected by AgentFlow against pinned commit `{commit_sha}`.
+Execute exactly the Hunt injected by AgentFlow against the pinned source checkout.
 
 First call `bugdb.get_hunt` with no arguments. Respect its kind and scope:
 

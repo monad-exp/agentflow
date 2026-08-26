@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import socket
+import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
@@ -12,10 +13,11 @@ from agentflow.agents.base import AgentAdapter
 from agentflow.orchestrator import Orchestrator
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.registry import RunnerRegistry
-from agentflow.specs import AgentKind, NodeStatus, PipelineSpec
+from agentflow.specs import AgentKind, NodeStatus, PipelineSpec, RunRecord, RunStatus
 from agentflow.store import RunStore
 
 from tests.test_orchestrator import MockAdapter
+from tests.test_connectors import SERVER as CONNECTOR_SERVER
 
 
 class DurableRetryAdapter(AgentAdapter):
@@ -68,22 +70,12 @@ async def test_runtime_fanout_expands_json_collection_and_waits_for_every_member
                     "id": "rank",
                     "agent": "codex",
                     "prompt": '{"targets":[{"path":"api.py"},{"path":"auth.py"}]}',
-                    "output_schema": {
-                        "type": "object",
-                        "required": ["targets"],
-                        "properties": {"targets": {"type": "array"}},
-                    },
                 },
                 {
                     "id": "hunt",
                     "agent": "codex",
                     "prompt": "hunt {{ item.path }}",
                     "fanout_from": {"from": "rank", "path": "targets", "as": "target"},
-                    "input_schema": {
-                        "type": "object",
-                        "required": ["path"],
-                        "properties": {"path": {"type": "string"}},
-                    },
                 },
                 {
                     "id": "deduplicate",
@@ -109,6 +101,53 @@ async def test_runtime_fanout_expands_json_collection_and_waits_for_every_member
     assert completed.nodes["hunt_1"].output.startswith("hunt auth.py")
     assert "api.py=hunt api.py" in completed.nodes["deduplicate"].output
     assert "auth.py=hunt auth.py" in completed.nodes["deduplicate"].output
+    assert pipeline.fanouts == {}
+    assert [node.id for node in pipeline.nodes] == ["rank", "hunt", "deduplicate"]
+    assert completed.declared_pipeline is not None
+    assert completed.declared_pipeline.fanouts == {}
+
+
+@pytest.mark.asyncio
+async def test_runtime_fanout_is_independent_across_submissions_reruns_and_reload(tmp_path: Path):
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "run-local-fanout",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {"id": "rank", "agent": "codex", "prompt": '[{"path":"api.py"}]'},
+                {
+                    "id": "hunt",
+                    "agent": "codex",
+                    "prompt": "hunt {{ item.path }}",
+                    "fanout_from": {"from": "rank"},
+                },
+            ],
+        }
+    )
+
+    first, second = await asyncio.gather(orchestrator.submit(pipeline), orchestrator.submit(pipeline))
+    first_done, second_done = await asyncio.gather(
+        orchestrator.wait(first.id, timeout=5),
+        orchestrator.wait(second.id, timeout=5),
+    )
+    rerun = await orchestrator.rerun(first_done.id)
+    rerun_done = await orchestrator.wait(rerun.id, timeout=5)
+
+    assert pipeline.fanouts == {}
+    assert [node.id for node in pipeline.nodes] == ["rank", "hunt"]
+    for record in (first_done, second_done, rerun_done):
+        assert record.status == RunStatus.COMPLETED
+        assert record.pipeline.fanouts["hunt"] == ["hunt_0"]
+        assert record.nodes["hunt"].structured_output == [{"path": "api.py"}]
+        assert record.declared_pipeline is not None
+        assert record.declared_pipeline.fanouts == {}
+        assert [node.id for node in record.declared_pipeline.nodes] == ["rank", "hunt"]
+
+    reloaded = RunStore(orchestrator.store.base_dir).get_run(first_done.id)
+    assert reloaded.pipeline.fanouts["hunt"] == ["hunt_0"]
+    assert reloaded.pipeline.node_map["hunt_0"].fanout_member is not None
+    assert reloaded.pipeline.node_map["hunt_0"].fanout_member["path"] == "api.py"
 
 
 @pytest.mark.asyncio
@@ -129,7 +168,7 @@ async def test_runtime_fanin_completes_after_failed_member_so_mandatory_review_r
                     "agent": "codex",
                     "prompt": "not-json",
                     "fanout_from": {"from": "rank", "path": "targets"},
-                    "output_schema": {"type": "object"},
+                    "success_criteria": [{"kind": "output_contains", "value": "expected-marker"}],
                 },
                 {
                     "id": "mandatory_review",
@@ -217,34 +256,22 @@ async def test_runtime_fanout_rejects_member_id_collisions(tmp_path: Path):
     assert "already exist" in completed.nodes["hunt"].success_details[0]
 
 
-@pytest.mark.asyncio
-async def test_output_contract_failure_is_a_node_failure(tmp_path: Path):
-    orchestrator = _orchestrator(tmp_path)
-    pipeline = PipelineSpec.model_validate(
-        {
-            "name": "contract-failure",
-            "working_dir": str(tmp_path),
-            "nodes": [
-                {
-                    "id": "rank",
-                    "agent": "codex",
-                    "prompt": '{"targets":"not-an-array"}',
-                    "output_schema": {
-                        "type": "object",
-                        "required": ["targets"],
-                        "properties": {"targets": {"type": "array"}},
-                    },
-                }
-            ],
-        }
-    )
-
-    submitted = await orchestrator.submit(pipeline)
-    completed = await orchestrator.wait(submitted.id, timeout=5)
-
-    assert completed.status.value == "failed"
-    assert completed.nodes["rank"].status == NodeStatus.FAILED
-    assert any("is not of type 'array'" in detail for detail in completed.nodes["rank"].success_details)
+def test_node_stdout_contracts_are_not_part_of_the_pipeline_api(tmp_path: Path):
+    with pytest.raises(ValueError, match="output_schema"):
+        PipelineSpec.model_validate(
+            {
+                "name": "no-stdout-contract",
+                "working_dir": str(tmp_path),
+                "nodes": [
+                    {
+                        "id": "rank",
+                        "agent": "codex",
+                        "prompt": "rank",
+                        "output_schema": {"type": "object"},
+                    }
+                ],
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -282,10 +309,153 @@ async def test_named_concurrency_pool_limits_provider_parallelism(tmp_path: Path
     assert elapsed >= 0.45
 
 
-def _available_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
+@pytest.mark.asyncio
+async def test_named_pool_is_acquired_before_global_capacity(tmp_path: Path, monkeypatch):
+    acquisition_order: list[str] = []
+
+    class RecordingSemaphore:
+        def __init__(self, value: int):
+            self.name = "global" if value == 2 else "pool"
+
+        async def __aenter__(self):
+            acquisition_order.append(self.name)
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def acquire(self):
+            acquisition_order.append(self.name)
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr("agentflow.orchestrator.asyncio.Semaphore", RecordingSemaphore)
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "pool-order",
+            "working_dir": str(tmp_path),
+            "concurrency": 2,
+            "concurrency_pools": {"provider": 1},
+            "nodes": [
+                {
+                    "id": "only",
+                    "agent": "codex",
+                    "prompt": "done",
+                    "concurrency_pool": "provider",
+                }
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert acquisition_order[:2] == ["pool", "global"]
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+
+
+@pytest.mark.asyncio
+async def test_source_input_resolves_to_one_shared_detached_worktree(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _git(repo, "config", "user.email", "tests@example.test")
+    _git(repo, "config", "user.name", "AgentFlow Tests")
+    (repo / "source.txt").write_text("pinned\n", encoding="utf-8")
+    _git(repo, "add", "source.txt")
+    _git(repo, "commit", "-q", "-m", "source")
+    commit_sha = _git(repo, "rev-parse", "HEAD")
+
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "pinned-source",
+            "working_dir": str(repo),
+            "source_snapshot": {
+                "repositoryUrl": "https://example.test/owner/repository.git",
+                "inputRef": "HEAD",
+            },
+            "nodes": [
+                {
+                    "id": node_id,
+                    "agent": "python",
+                    "prompt": (
+                        "import os, subprocess; "
+                        "print(os.getcwd()); "
+                        "print(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())"
+                    ),
+                }
+                for node_id in ("first", "second")
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert completed.source_snapshot is not None
+    assert completed.source_snapshot.commit_sha == commit_sha
+    assert completed.source_snapshot.input_ref == "HEAD"
+    workdirs = {
+        (completed.nodes[node_id].output or "").splitlines()[0]
+        for node_id in ("first", "second")
+    }
+    assert len(workdirs) == 1
+    workdir = Path(workdirs.pop())
+    assert workdir.name == "source"
+    assert not workdir.exists()
+    assert completed.declared_pipeline is not None
+    assert completed.declared_pipeline.working_path == repo.resolve()
+    assert pipeline.working_path == repo.resolve()
+    snapshot = json.loads(
+        (orchestrator.store.run_artifact_dir(completed.id) / "source-snapshot.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert snapshot == {
+        "repositoryUrl": "https://example.test/owner/repository.git",
+        "inputRef": "HEAD",
+        "commitSha": commit_sha,
+    }
+
+
+@pytest.mark.asyncio
+async def test_source_invalid_ref_fails_before_nodes(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _git(repo, "config", "user.email", "tests@example.test")
+    _git(repo, "config", "user.name", "AgentFlow Tests")
+    (repo / "source.txt").write_text("source\n", encoding="utf-8")
+    _git(repo, "add", "source.txt")
+    _git(repo, "commit", "-q", "-m", "source")
+
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "wrong-source",
+            "working_dir": str(repo),
+            "source_snapshot": {
+                "repositoryUrl": "https://example.test/repository.git",
+                "inputRef": "refs/heads/missing",
+            },
+            "nodes": [{"id": "never", "agent": "codex", "prompt": "never"}],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+
+    assert completed.status == RunStatus.FAILED
+    assert completed.nodes["never"].status == NodeStatus.SKIPPED
+    assert any(event.type == "source_snapshot_failed" for event in orchestrator.store.get_events(completed.id))
 
 
 @pytest.mark.asyncio
@@ -293,7 +463,6 @@ async def test_connector_command_is_run_scoped_and_injected_without_database_env
     tmp_path: Path,
     monkeypatch,
 ):
-    port = _available_port()
     monkeypatch.setenv("BUGDB_SOURCE_URL", "postgresql://application-role")
     orchestrator = _orchestrator(tmp_path)
     pipeline = PipelineSpec.model_validate(
@@ -303,9 +472,10 @@ async def test_connector_command_is_run_scoped_and_injected_without_database_env
             "connectors": [
                 {
                     "name": "bugdb",
-                    "url": f"http://127.0.0.1:{port}/mcp",
+                    "url": "http://127.0.0.1:{port}/mcp",
                     "command": "python3",
-                    "args": ["-m", "http.server", str(port), "--bind", "127.0.0.1"],
+                    "args": ["-c", CONNECTOR_SERVER],
+                    "env": {"TEST_CONNECTOR_PORT": "{port}"},
                     "env_from": {"DATABASE_URL": "BUGDB_SOURCE_URL"},
                     "tools": [
                         {
@@ -335,19 +505,21 @@ async def test_connector_command_is_run_scoped_and_injected_without_database_env
 
     assert completed.status.value == "completed"
     node = completed.pipeline.node_map["deduplicate"]
-    assert node.mcps[0].name == "bugdb"
+    assert node.mcps == []
+    assert node.connector_bindings[0].name == "bugdb"
     assert "DATABASE_URL" not in node.env
     assert completed.nodes["deduplicate"].output == "DATABASE_URL=None BUGDB_SOURCE_URL=None"
     event_types = [event.type for event in orchestrator.store.get_events(completed.id)]
     assert "connectors_ready" in event_types
     assert "connectors_stopped" in event_types
+    port = urlparse(node.connector_bindings[0].url).port
+    assert port is not None
     with pytest.raises(OSError):
         await asyncio.open_connection("127.0.0.1", port)
 
 
 @pytest.mark.asyncio
 async def test_connector_stops_when_node_process_cannot_launch(tmp_path: Path):
-    port = _available_port()
     orchestrator = Orchestrator(
         store=RunStore(tmp_path / "runs"),
         adapters=AdapterRegistry(),
@@ -360,9 +532,15 @@ async def test_connector_stops_when_node_process_cannot_launch(tmp_path: Path):
             "connectors": [
                 {
                     "name": "bugdb",
-                    "url": f"http://127.0.0.1:{port}/mcp",
+                    "url": "http://127.0.0.1:{port}/mcp",
                     "command": "python3",
-                    "args": ["-m", "http.server", str(port), "--bind", "127.0.0.1"],
+                    "args": ["-c", CONNECTOR_SERVER],
+                    "env": {"TEST_CONNECTOR_PORT": "{port}"},
+                    "tools": [{
+                        "name": "noop",
+                        "description": "No-op fixture tool",
+                        "input_schema": {"type": "object"},
+                    }],
                 }
             ],
             "nodes": [
@@ -382,22 +560,93 @@ async def test_connector_stops_when_node_process_cannot_launch(tmp_path: Path):
 
     assert completed.status.value == "failed"
     assert "node execution crashed" in completed.nodes["cannot_launch"].success_details[0]
+    binding = completed.pipeline.node_map["cannot_launch"].connector_bindings[0]
+    port = urlparse(binding.url).port
+    assert port is not None
+    with pytest.raises(OSError):
+        await asyncio.open_connection("127.0.0.1", port)
+
+
+@pytest.mark.asyncio
+async def test_connector_stops_when_scheduler_crashes(tmp_path: Path):
+    class CrashingOrchestrator(Orchestrator):
+        def _register_shared_resources(self, pipeline):
+            raise RuntimeError("scheduler crash")
+
+    adapters = AdapterRegistry()
+    adapters.register(AgentKind.CODEX, MockAdapter())
+    orchestrator = CrashingOrchestrator(
+        store=RunStore(tmp_path / "runs"),
+        adapters=adapters,
+        runners=RunnerRegistry(),
+    )
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "scheduler-crash-cleanup",
+            "working_dir": str(tmp_path),
+            "connectors": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:{port}/mcp",
+                    "command": "python3",
+                    "args": ["-c", CONNECTOR_SERVER],
+                    "env": {"TEST_CONNECTOR_PORT": "{port}"},
+                    "tools": [{
+                        "name": "noop",
+                        "description": "No-op fixture tool",
+                        "input_schema": {"type": "object"},
+                    }],
+                }
+            ],
+            "nodes": [
+                {
+                    "id": "never",
+                    "agent": "codex",
+                    "prompt": "never",
+                    "connectors": ["bugdb"],
+                }
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+
+    assert completed.status == RunStatus.FAILED
+    assert any(event.type == "scheduler_failed" for event in orchestrator.store.get_events(completed.id))
+    binding = completed.pipeline.node_map["never"].connector_bindings[0]
+    port = urlparse(binding.url).port
+    assert port is not None
     with pytest.raises(OSError):
         await asyncio.open_connection("127.0.0.1", port)
 
 
 @pytest.mark.asyncio
 async def test_connector_backed_fanout_uses_durable_ids_and_writes_report_artifacts(tmp_path: Path):
-    port = _available_port()
     server_script = r'''
 import json
-import sys
+import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+run_id = os.environ["AGENTFLOW_RUN_ID"]
+nonce = os.environ["AGENTFLOW_CONNECTOR_NONCE"]
+control_token = os.environ["AGENTFLOW_CONTROL_TOKEN"]
+port = int(os.environ["AGENTFLOW_CONNECTOR_PORT"])
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        payload = ["hunt-file", "hunt-threat", "hunt-exhausted"] if self.path.endswith("/hunts") else ["finding-cross-file"]
-        body = json.dumps(payload).encode()
+        if self.headers.get("x-agentflow-control-token") != control_token:
+            self.send_response(403)
+            self.end_headers()
+            return
+        if self.path == "/healthz":
+            body = json.dumps({"ok": True, "runId": run_id, "nonce": nonce}).encode()
+        else:
+            body = json.dumps(
+                ["hunt-file", "hunt-threat", "hunt-exhausted"]
+                if self.path.endswith("/hunts")
+                else ["finding-cross-file"]
+            ).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
@@ -406,7 +655,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
+HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 '''
     orchestrator = _orchestrator(tmp_path)
     pipeline = PipelineSpec.model_validate(
@@ -414,18 +663,13 @@ HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
             "name": "durable-bugfinder-fixture",
             "working_dir": str(tmp_path),
             "fail_fast": False,
-            "source_snapshot": {
-                "repositoryUrl": "https://example.test/owner/repository.git",
-                "inputRef": "main",
-                "commitSha": "0123456789abcdef0123456789abcdef01234567",
-            },
             "connectors": [
                 {
                     "name": "bugdb",
-                    "url": f"http://127.0.0.1:{port}/mcp",
-                    "control_url": f"http://127.0.0.1:{port}/orchestration",
+                    "url": "http://127.0.0.1:{port}/mcp",
+                    "control_url": "http://127.0.0.1:{port}/orchestration",
                     "command": "python3",
-                    "args": ["-c", server_script, str(port)],
+                    "args": ["-c", server_script],
                     "tools": [
                         {
                             "name": "get_hunt",
@@ -516,20 +760,176 @@ HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
 
     report = orchestrator.store.read_artifact_text(completed.id, "report_0", "report.md")
     assert report.startswith("# Finding report")
-    snapshot_path = orchestrator.store.run_artifact_dir(completed.id) / "source-snapshot.json"
-    assert json.loads(snapshot_path.read_text(encoding="utf-8"))["commitSha"].startswith("01234567")
-
     member = completed.pipeline.node_map["hunt_0"]
     headers = member.connector_bindings[0].headers
     assert headers["x-agentflow-item-id"] == "hunt-file"
     assert len(headers["x-agentflow-item-signature"]) == 64
-    assert member.mcps[0].headers == {}
+    assert member.mcps == []
     persisted_run = (orchestrator.store.run_dir(completed.id) / "run.json").read_text(encoding="utf-8")
     assert headers["x-agentflow-item-signature"] not in persisted_run
 
 
 @pytest.mark.asyncio
-async def test_supervised_durable_goal_retries_from_connector_checkpoint(tmp_path: Path):
+async def test_connector_backed_fanout_rejects_duplicate_durable_ids(tmp_path: Path):
+    class DuplicateConnectorManager:
+        async def start(self, _run_id, _pipeline, _run_dir):
+            pass
+
+        async def fetch_collection(self, _run_id, _connector, _resource):
+            return ["same-hunt", "same-hunt"]
+
+        async def stop(self, _run_id):
+            pass
+
+    orchestrator = _orchestrator(tmp_path)
+    orchestrator._connector_manager = DuplicateConnectorManager()
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "duplicate-durable-fanout",
+            "working_dir": str(tmp_path),
+            "connectors": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:{port}/mcp",
+                    "control_url": "http://127.0.0.1:{port}/orchestration",
+                    "command": "unused",
+                }
+            ],
+            "nodes": [
+                {"id": "rank", "agent": "codex", "prompt": "ranked"},
+                {
+                    "id": "hunt",
+                    "agent": "codex",
+                    "prompt": "hunt",
+                    "fanout_from": {
+                        "from": "rank",
+                        "connector": "bugdb",
+                        "resource": "hunts",
+                    },
+                },
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+
+    assert completed.status == RunStatus.FAILED
+    assert completed.nodes["hunt"].status == NodeStatus.FAILED
+    assert "duplicate stable IDs" in completed.nodes["hunt"].success_details[0]
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_connector_backed_runtime_fanout(tmp_path: Path):
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "connector-recovery",
+            "working_dir": str(tmp_path),
+            "connectors": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:{port}/mcp",
+                    "control_url": "http://127.0.0.1:{port}/orchestration",
+                    "command": "python3",
+                }
+            ],
+            "nodes": [
+                {"id": "rank", "agent": "codex", "prompt": "rank"},
+                {
+                    "id": "hunt",
+                    "agent": "codex",
+                    "prompt": "hunt",
+                    "connectors": ["bugdb"],
+                    "fanout_from": {
+                        "from": "rank",
+                        "connector": "bugdb",
+                        "resource": "hunts",
+                    },
+                },
+            ],
+        }
+    )
+    failed = RunRecord(
+        id=orchestrator.store.new_run_id(),
+        status=RunStatus.FAILED,
+        pipeline=pipeline.model_copy(deep=True),
+        declared_pipeline=pipeline.model_copy(deep=True),
+    )
+    await orchestrator.store.create_run(failed)
+
+    with pytest.raises(ValueError, match="connector-backed runtime fan-out"):
+        await orchestrator.resume(failed.id)
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_source_pinned_run(tmp_path: Path):
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "source-recovery",
+            "working_dir": str(tmp_path),
+            "source_snapshot": {
+                "repositoryUrl": "https://example.test/repository.git",
+                "inputRef": "main",
+            },
+            "nodes": [{"id": "scan", "agent": "codex", "prompt": "scan"}],
+        }
+    )
+    failed = RunRecord(
+        id=orchestrator.store.new_run_id(),
+        status=RunStatus.FAILED,
+        pipeline=pipeline.model_copy(deep=True),
+        declared_pipeline=pipeline.model_copy(deep=True),
+    )
+    await orchestrator.store.create_run(failed)
+
+    with pytest.raises(ValueError, match="source-pinned runs"):
+        await orchestrator.resume(failed.id)
+
+
+@pytest.mark.asyncio
+async def test_run_store_does_not_persist_resolved_connector_urls(tmp_path: Path):
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "runtime-url",
+            "working_dir": str(tmp_path),
+            "connectors": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:{port}/mcp",
+                    "command": "python3",
+                }
+            ],
+            "nodes": [
+                {
+                    "id": "hunt",
+                    "agent": "codex",
+                    "prompt": "hunt",
+                    "connectors": ["bugdb"],
+                    "connector_bindings": [
+                        {
+                            "name": "bugdb",
+                            "url": "http://127.0.0.1:54321/mcp",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    declared = pipeline.model_copy(deep=True)
+    declared.node_map["hunt"].connector_bindings = []
+    record = RunRecord(id="runtime-url", pipeline=pipeline, declared_pipeline=declared)
+    store = RunStore(tmp_path / "runs")
+    await store.create_run(record)
+
+    persisted = (store.run_dir(record.id) / "run.json").read_text(encoding="utf-8")
+    assert "http://127.0.0.1:54321/mcp" not in persisted
+    assert record.pipeline.node_map["hunt"].connector_bindings[0].url == "http://127.0.0.1:54321/mcp"
+
+
+@pytest.mark.asyncio
+async def test_supervised_durable_goal_retries_from_connector_state(tmp_path: Path):
     adapters = AdapterRegistry()
     adapters.register(AgentKind.CODEX, DurableRetryAdapter())
     orchestrator = Orchestrator(
@@ -560,9 +960,68 @@ async def test_supervised_durable_goal_retries_from_connector_checkpoint(tmp_pat
     assert completed.status.value == "completed"
     assert len(completed.nodes["hunt"].attempts) == 2
     assert "AgentFlow supervised durable-goal resume" in (completed.nodes["hunt"].output or "")
-    checkpoint = orchestrator.store.read_artifact_text(
-        completed.id,
-        "hunt",
-        "durable-goal-checkpoint-attempt-1.json",
+    checkpoint = orchestrator.store.artifact_path(
+        completed.id, "hunt", "durable-goal-checkpoint-attempt-1.json"
     )
-    assert json.loads(checkpoint)["resumeMode"] == "supervised"
+    assert not checkpoint.exists()
+
+
+@pytest.mark.asyncio
+async def test_native_durable_goal_fails_without_a_tested_adapter_integration(tmp_path: Path):
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "native-goal",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {
+                    "id": "hunt",
+                    "agent": "codex",
+                    "prompt": "continue",
+                    "durable_goal": {"mode": "native"},
+                }
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+
+    assert completed.status == RunStatus.FAILED
+    assert "no tested native durable-goal integration" in completed.nodes["hunt"].success_details[0]
+
+
+@pytest.mark.asyncio
+async def test_workflow_deadline_cancels_running_and_pending_nodes(tmp_path: Path):
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "workflow-deadline",
+            "working_dir": str(tmp_path),
+            "deadline_seconds": 1,
+            "nodes": [
+                {
+                    "id": "slow",
+                    "agent": "python",
+                    "prompt": "import time; time.sleep(5)",
+                },
+                {
+                    "id": "after",
+                    "agent": "codex",
+                    "prompt": "must not start",
+                    "depends_on": ["slow"],
+                },
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+
+    assert completed.status == RunStatus.FAILED
+    assert completed.nodes["slow"].status == NodeStatus.CANCELLED
+    assert completed.nodes["after"].status == NodeStatus.CANCELLED
+    assert any(
+        event.type == "run_deadline_exceeded"
+        for event in orchestrator.store.get_events(completed.id)
+    )

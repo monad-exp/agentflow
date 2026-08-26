@@ -24,6 +24,21 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
   afterAll(async () => prisma.$disconnect());
 
   test("merges FILE and THREAT_MODEL Leads while preserving an exhausted Hunt", async () => {
+    await expect(
+      addHunts(prisma, runScope, {
+        hunts: [
+          { callerKey: "duplicate", kind: HuntKind.ROAM, objective: "First", paths: [] },
+          { callerKey: "duplicate", kind: HuntKind.ROAM, objective: "Second", paths: [] },
+        ],
+      }),
+    ).rejects.toThrow(/caller keys must be unique/);
+    await expect(
+      addHunts(prisma, runScope, {
+        hunts: [{ callerKey: "blank", kind: HuntKind.ROAM, objective: "   ", paths: [] }],
+      }),
+    ).rejects.toThrow();
+    expect(await prisma.hunt.count({ where: { runId } })).toBe(0);
+
     const huntsInput = {
       hunts: [
         {
@@ -90,6 +105,15 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
       result: HuntResult.BUG_FOUND,
       resultSummary: "Committed one cross-file threat-model Lead.",
     });
+    const durableLeadReplay = await addLead(prisma, { runId, itemId: hunts[0].id }, {
+      callerKey: "parser-mode-missing-from-key",
+      claim: "The parser cache key omits parse mode.",
+      locations: ["src/parser.ts:42"],
+      evidence: "The key is constructed from source text only before cache lookup.",
+      impact: "A caller can receive an AST produced under a different mode.",
+      validationPlan: "Parse the same source under two modes and compare cache hits.",
+    });
+    expect(durableLeadReplay.id).toBe(fileLead.id);
     await finishHunt(prisma, { runId, itemId: hunts[2].id }, {
       result: HuntResult.EXHAUSTED,
       resultSummary: "No additional concrete defect survived validation.",
@@ -99,6 +123,25 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
       resultSummary: "No additional concrete defect survived validation.",
     });
     expect(exhaustedReplay.result).toBe(HuntResult.EXHAUSTED);
+    await expect(
+      addLead(prisma, { runId, itemId: hunts[2].id }, {
+        callerKey: "late-lead",
+        claim: "This Lead must not be appended after Hunt completion.",
+        locations: ["src/late.ts:1"],
+        evidence: "The Hunt already has a final result.",
+      }),
+    ).rejects.toThrow(/already finished/);
+    await expect(
+      prisma.lead.create({
+        data: {
+          id: `late-${randomUUID()}`,
+          huntId: hunts[2].id,
+          claim: "Direct inserts must obey the same terminal Hunt invariant.",
+          locations: ["src/late.ts:2"],
+          evidence: "This write bypasses the connector guard.",
+        },
+      }),
+    ).rejects.toThrow(/cannot append a Lead after its Hunt is finished/);
 
     const durableInput = await listHuntsAndLeads(prisma, runScope);
     expect(durableInput).toHaveLength(3);
@@ -113,6 +156,22 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
         leadIds: [fileLead.id, threatLead.id],
       }],
     };
+    await expect(
+      createFindings(prisma, runScope, {
+        findings: [{ ...findingAppend.findings[0], leadIds: [fileLead.id] }],
+      }),
+    ).rejects.toThrow(/partition every Lead/);
+    expect(await prisma.finding.count({ where: { runId } })).toBe(0);
+    expect(await prisma.lead.count({ where: { id: { in: [fileLead.id, threatLead.id] }, findingId: null } })).toBe(2);
+    await expect(
+      createFindings(prisma, runScope, {
+        findings: [
+          { ...findingAppend.findings[0], leadIds: [fileLead.id] },
+          { ...findingAppend.findings[0], leadIds: [threatLead.id] },
+        ],
+      }),
+    ).rejects.toThrow(/caller keys must be unique/);
+    expect(await prisma.finding.count({ where: { runId } })).toBe(0);
     const [findings, concurrentReplay] = await Promise.all([
       createFindings(prisma, runScope, findingAppend),
       createFindings(prisma, runScope, findingAppend),
@@ -123,6 +182,21 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
       new Set([HuntKind.FILE, HuntKind.THREAT_MODEL]),
     );
     expect(concurrentReplay[0].id).toBe(findings[0].id);
+    await expect(
+      createFindings(prisma, runScope, {
+        findings: [
+          { ...findingAppend.findings[0], leadIds: [fileLead.id] },
+          {
+            callerKey: "second-finding",
+            title: "A different grouping",
+            rootCause: "A different root cause",
+            impact: "A different impact",
+            leadIds: [threatLead.id],
+          },
+        ],
+      }),
+    ).rejects.toThrow(/idempotency conflict/);
+    expect(await prisma.finding.count({ where: { runId } })).toBe(1);
 
     const findingScope = { runId, itemId: findings[0].id };
     await setTriage(prisma, findingScope, {
@@ -141,6 +215,7 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
     const finding = await getFinding(prisma, findingScope);
     expect(finding.triageVerdict).toBe(FindingVerdict.CONFIRMED);
     expect(finding.rereviewVerdict).toBe(FindingVerdict.CONFIRMED);
+    expect(finding.disposition).toBe(FindingVerdict.CONFIRMED);
     expect(finding.leads).toHaveLength(2);
 
     await expect(
@@ -153,8 +228,47 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
 
   test("the app role cannot mutate canonical fields and the schema contains no JSON", async () => {
     const hunts = await prisma.hunt.findMany({ where: { runId }, take: 1 });
+    const findings = await prisma.finding.findMany({ where: { runId }, take: 1 });
     await expect(
       prisma.hunt.update({ where: { id: hunts[0].id }, data: { objective: "forbidden mutation" } }),
+    ).rejects.toThrow();
+    await expect(
+      prisma.hunt.create({
+        data: {
+          id: `forbidden-result-${randomUUID()}`,
+          runId,
+          kind: HuntKind.ROAM,
+          objective: "Cannot insert a pre-finished Hunt.",
+          paths: [],
+          result: HuntResult.EXHAUSTED,
+          resultSummary: "Forbidden direct result.",
+        },
+      }),
+    ).rejects.toThrow();
+    await expect(
+      prisma.lead.create({
+        data: {
+          id: `forbidden-finding-${randomUUID()}`,
+          huntId: hunts[0].id,
+          findingId: findings[0].id,
+          claim: "Cannot insert a pre-assigned Lead.",
+          locations: ["src/forbidden.ts:1"],
+          evidence: "Forbidden direct membership.",
+        },
+      }),
+    ).rejects.toThrow();
+    await expect(
+      prisma.finding.create({
+        data: {
+          id: `forbidden-review-${randomUUID()}`,
+          runId,
+          title: "Cannot insert a pre-reviewed Finding",
+          rootCause: "Forbidden direct review fields.",
+          impact: "The write must fail.",
+          triageVerdict: FindingVerdict.CONFIRMED,
+          triageAssessment: "Forbidden direct review.",
+        },
+      }),
     ).rejects.toThrow();
 
     const jsonColumns = await prisma.$queryRaw<Array<{ column_name: string }>>`

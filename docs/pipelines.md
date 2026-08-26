@@ -50,10 +50,11 @@ Each node supports:
 - `repo_instructions_mode`: `inherit` (default) or `ignore` for agent CLIs that should not absorb repo-local instruction files such as `AGENTS.md`, `CLAUDE.md`, or project skills
 - `mcps`: a list of MCP server definitions
 - `connectors`: names of top-level run-scoped connectors to inject
-- `input`, `input_schema`, and `output_schema`: typed JSON node contracts
+- `connector_tools`: optional connector-to-tool allowlists for this node
+- `input`: optional structured JSON supplied to the node
 - `output_artifact`: additional relative artifact path for the final response, such as `report.md`
 - `concurrency_pool`: a named top-level provider concurrency limit
-- `durable_goal`: `supervised` connector-state resume or executor-native `/goal` execution
+- `durable_goal`: `supervised` connector-state retry or reserved `native` execution
 - `skills`: a list of local skill paths or names
 - `target`: `local`, `docker`, `container`, `ssh`, `ec2`, or `ecs`
 - local target fields: `cwd`, `bootstrap`, `shell`, `shell_login`, `shell_interactive`, and `shell_init`
@@ -66,9 +67,10 @@ Skill entries are resolved from the pipeline `working_dir`. You can point `skill
 Top-level pipeline controls include:
 
 - `concurrency`: max parallel nodes within a run
+- `deadline_seconds`: optional wall-clock limit for scheduling and node execution after setup
 - `concurrency_pools`: independent named limits shared by selected nodes
 - `connectors`: run-scoped streamable-HTTP tool services, with optional process lifecycle and explicit environment injection
-- `source_snapshot`: resolved `repositoryUrl`, `inputRef`, and 40- or 64-character `commitSha` persisted before analysis
+- `source_snapshot`: `repositoryUrl` and `inputRef` resolved and pinned when the run starts
 - `fail_fast`: skip downstream work after the first failed node
 - `node_defaults`: shared node fields merged into every node before validation
 - `agent_defaults`: agent-specific shared node fields keyed by `codex`, `claude`, or `kimi`
@@ -128,7 +130,7 @@ with DAG("sweep-demo", concurrency=8) as dag:
     review >> final
 ```
 
-### Runtime fan-out and typed contracts
+### Runtime fan-out
 
 `fanout_from()` reads a JSON collection from a completed source node and
 materializes one member per value. `path` accepts a dotted path such as
@@ -142,17 +144,11 @@ with DAG("dynamic-sweep", concurrency=16) as dag:
     plan = codex(
         task_id="plan",
         prompt="Return JSON with a targets array.",
-        output_schema={
-            "type": "object",
-            "required": ["targets"],
-            "properties": {"targets": {"type": "array"}},
-        },
     )
     worker = fanout_from(
         codex(
             task_id="worker",
             prompt="Process the AgentFlow structured input.",
-            input_schema={"type": "object", "required": ["path"]},
         ),
         plan,
         path="targets",
@@ -180,10 +176,6 @@ hunt = fanout_from(
 )
 ```
 
-`input_schema` validates `input` (or the current fan-out value) before launch.
-`output_schema` parses the final response as JSON and fails the node when the
-contract does not match. Parsed values are available as `nodes.<id>.data`.
-
 ### Run-scoped connectors
 
 Top-level `connectors` describe a streamable-HTTP tool service. `command` and
@@ -198,21 +190,28 @@ tokens and signed item bindings are excluded from persisted pipeline state;
 agents cannot choose another Hunt/Finding ID through tool arguments.
 
 Codex and Claude receive connectors as MCP servers. Pi receives a generated
-extension exposing the same namespaced logical tools. Connector tool metadata
-(`name`, `description`, and `input_schema`) is required for the Pi bridge.
-Connector credential names are stripped from local agent subprocesses.
+extension exposing the same namespaced logical tools. AgentFlow uses declared
+tool metadata (`name`, `description`, and `input_schema`), or schemas discovered
+from a managed connector, for the Pi bridge.
+Connector credential names are stripped from local agent subprocesses. Set
+`connector_tools={"bugdb": ["get_hunt", "add_lead"]}` on a node to expose only
+those tools. Omit the entry to expose all declared tools for that connector.
 
 ### Source snapshots and durable goals
 
-`source_snapshot` is copied into the run record and
-`artifacts/_run/source-snapshot.json` before inference services, connectors, or
-analysis nodes start. The commit must be a resolved 40- or 64-character SHA.
+AgentFlow resolves `source_snapshot.inputRef` in the configured `working_dir`
+when the run starts. It persists `repositoryUrl`, `inputRef`, and the resolved
+commit in the run record and `artifacts/_run/source-snapshot.json`. It then runs
+local nodes from one detached, run-scoped worktree. Resolution and worktree
+creation finish before inference services, connectors, or nodes start.
+Source-pinned runs use `rerun`, not `resume`, so completed work is never mixed
+across commits.
 
 `durable_goal={"mode": "supervised"}` uses ordinary AgentFlow retries as
-provider-neutral checkpoint/resume: a failed attempt writes a
-`durable-goal-checkpoint-attempt-N.json` artifact and the next attempt is told to
-re-read connector state and reuse idempotency keys. `mode="native"` prefixes
-`/goal` for an executor that supports that command.
+provider-neutral resume: the next attempt re-reads connector state and reuses
+idempotency keys. Built-in adapters reject `mode="native"` until an adapter has
+a tested native durable-goal lifecycle; AgentFlow does not simulate it with a
+prompt prefix.
 
 Named `concurrency_pools` cap shared providers without reducing unrelated work:
 

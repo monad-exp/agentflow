@@ -18,18 +18,6 @@ def check_json_schema(schema: dict[str, Any], *, label: str) -> None:
         raise ValueError(f"{label} is not a valid JSON Schema: {exc.message}") from exc
 
 
-def validate_json_contract(value: Any, schema: dict[str, Any], *, label: str) -> list[str]:
-    """Return stable, human-readable validation failures for ``value``."""
-
-    validator = Draft202012Validator(schema)
-    errors = sorted(validator.iter_errors(value), key=lambda error: list(error.absolute_path))
-    messages: list[str] = []
-    for error in errors:
-        path = ".".join(str(part) for part in error.absolute_path) or "$"
-        messages.append(f"{label} at {path}: {error.message}")
-    return messages
-
-
 def parse_json_output(text: str | None) -> tuple[Any | None, str | None]:
     """Parse an agent's JSON response, accepting a single fenced JSON block."""
 

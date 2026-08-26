@@ -128,6 +128,7 @@ class Graph:
         optimizer: str | None = None,
         n_run: int = 1,
         concurrency: int = 4,
+        deadline_seconds: int | None = None,
         fail_fast: bool = False,
         max_iterations: int = 10,
         scratchboard: bool = False,
@@ -146,6 +147,7 @@ class Graph:
         self.optimizer = optimizer
         self.n_run = n_run
         self.concurrency = concurrency
+        self.deadline_seconds = deadline_seconds
         self.fail_fast = fail_fast
         self.max_iterations = max_iterations
         self.scratchboard = scratchboard
@@ -192,6 +194,8 @@ class Graph:
             payload["optimizer"] = self.optimizer
         payload["n_run"] = self.n_run
         payload["concurrency"] = self.concurrency
+        if self.deadline_seconds is not None:
+            payload["deadline_seconds"] = self.deadline_seconds
         payload["fail_fast"] = self.fail_fast
         payload["max_iterations"] = self.max_iterations
         payload["scratchboard"] = self.scratchboard

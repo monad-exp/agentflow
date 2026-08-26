@@ -226,6 +226,7 @@ def test_codex_adapter_can_ignore_repo_instructions_with_isolated_runtime_cwd(tm
     assert "--add-dir" in prepared.command
     add_dir_index = prepared.command.index("--add-dir")
     assert prepared.command[add_dir_index + 1] == str(tmp_path)
+    assert f"AgentFlow pinned source checkout: {json.dumps(str(tmp_path))}" in prepared.command[-1]
 
 
 def test_claude_adapter_uses_tools_flag_for_read_only_access(tmp_path):
@@ -314,6 +315,8 @@ def test_claude_adapter_can_ignore_repo_instructions_with_bare_runtime_cwd(tmp_p
     add_dir_index = prepared.command.index("--add-dir")
     assert prepared.command[add_dir_index + 1] == str(tmp_path)
     assert prepared.cwd == str(tmp_path / ".runtime")
+    prompt_index = prepared.command.index("-p") + 1
+    assert f"AgentFlow pinned source checkout: {json.dumps(str(tmp_path))}" in prepared.command[prompt_index]
 
 
 def test_claude_adapter_supports_kimi_provider_alias(tmp_path, monkeypatch):
@@ -654,8 +657,9 @@ def test_pi_adapter_honors_repo_instructions_ignore(tmp_path):
     assert "--no-skills" in prepared.command
     assert "--no-extensions" in prepared.command
     assert "--no-prompt-templates" in prepared.command
-    # cwd moves out of the project workdir to avoid picking up AGENTS.md.
-    assert prepared.cwd == str(tmp_path / ".runtime")
+    assert "--no-context-files" in prepared.command
+    assert prepared.cwd == str(tmp_path)
+    assert f"AgentFlow pinned source checkout: {json.dumps(str(tmp_path))}" in (prepared.stdin or "")
 
 
 def test_pi_adapter_rejects_mcp_servers(tmp_path):
@@ -677,6 +681,7 @@ def test_pi_adapter_bridges_run_scoped_connector_tools_with_an_extension(tmp_pat
             "id": "scan",
             "agent": "pi",
             "prompt": "Scan",
+            "repo_instructions_mode": "ignore",
             "mcps": [{"name": "bugdb", "transport": "streamable_http", "url": "http://127.0.0.1:4312/mcp"}],
             "connector_bindings": [
                 {
@@ -701,6 +706,9 @@ def test_pi_adapter_bridges_run_scoped_connector_tools_with_an_extension(tmp_pat
     prepared = PiAdapter().prepare(node, "Scan", _paths(tmp_path))
 
     assert "--extension" in prepared.command
+    assert "--no-extensions" in prepared.command
+    assert "--no-context-files" in prepared.command
+    assert prepared.cwd == str(tmp_path)
     assert "bugdb_add_lead" in prepared.command[prepared.command.index("--tools") + 1]
     extension_path = str(Path("connectors") / "agentflow-connector-bridge.ts")
     extension = prepared.runtime_files[extension_path]

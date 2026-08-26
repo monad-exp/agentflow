@@ -2,78 +2,98 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import os
-import subprocess
 from pathlib import Path
-from typing import Any, Callable
+import subprocess
+from typing import Any, Callable, Mapping
 
-from agentflow import Graph, claude, codex, fanout_from, pi
+from agentflow import Graph, claude, codex, fanout_from, pi, python_node
 
 
 HERE = Path(__file__).resolve().parent
-REPOSITORY = Path(os.environ["BUGFINDER_REPO_PATH"]).expanduser().resolve()
-INPUT_REF = os.environ.get("BUGFINDER_INPUT_REF", os.environ.get("BUGFINDER_SOURCE_REF", "HEAD"))
-BUGDB_PORT = int(os.environ.get("BUGDB_PORT", "4312"))
+NO_HISTORY = "No external historical bug corpus was supplied for this run."
 
 
-def git(*args: str) -> str:
+def git(repository: Path, *args: str) -> str:
     return subprocess.check_output(
-        ["git", "-C", str(REPOSITORY), *args],
+        ["git", "-C", str(repository), *args],
         text=True,
     ).strip()
 
 
-COMMIT_SHA = git("rev-parse", f"{INPUT_REF}^{{commit}}").lower()
-if len(COMMIT_SHA) not in {40, 64} or any(char not in "0123456789abcdef" for char in COMMIT_SHA):
-    raise ValueError("BUGFINDER_INPUT_REF must resolve to a full 40- or 64-character commit SHA")
-if git("rev-parse", "HEAD").lower() != COMMIT_SHA:
-    raise ValueError(f"BUGFINDER_REPO_PATH must be checked out at resolved commit {COMMIT_SHA}")
-dirty_paths = git("status", "--porcelain", "--untracked-files=normal")
-if dirty_paths:
-    raise ValueError("BUGFINDER_REPO_PATH must be a clean worktree pinned to the resolved commit")
-REPOSITORY_URL = os.environ.get("BUGFINDER_REPOSITORY_URL")
-if not REPOSITORY_URL:
-    REPOSITORY_URL = git("config", "--get", "remote.origin.url")
+@dataclass(frozen=True)
+class BugfinderConfig:
+    repository: Path
+    repository_url: str
+    input_ref: str
+    historical_context: str = NO_HISTORY
+    environment: Mapping[str, str] = field(default_factory=dict, repr=False)
 
-history_file = os.environ.get("BUGFINDER_HISTORY_FILE")
-HISTORICAL_CONTEXT = (
-    Path(history_file).expanduser().read_text(encoding="utf-8")
-    if history_file
-    else "No external historical bug corpus was supplied for this run."
-)
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str] | None = None) -> "BugfinderConfig":
+        values = dict(os.environ if environment is None else environment)
+        raw_repository = values.get("BUGFINDER_REPO_PATH")
+        if not raw_repository:
+            raise ValueError("BUGFINDER_REPO_PATH is required")
+        repository = Path(raw_repository).expanduser().resolve()
+        input_ref = values.get("BUGFINDER_INPUT_REF", values.get("BUGFINDER_SOURCE_REF", "HEAD"))
+        repository_url = values.get("BUGFINDER_REPOSITORY_URL") or git(
+            repository, "config", "--get", "remote.origin.url"
+        )
+        history_file = values.get("BUGFINDER_HISTORY_FILE")
+        historical_context = (
+            Path(history_file).expanduser().read_text(encoding="utf-8")
+            if history_file
+            else NO_HISTORY
+        )
+        return cls(
+            repository=repository,
+            repository_url=repository_url,
+            input_ref=input_ref,
+            historical_context=historical_context,
+            environment=values,
+        )
+
+    def setting(self, name: str, default: str) -> str:
+        return self.environment.get(name, default)
 
 
 def prompt(name: str) -> str:
-    text = (HERE / "prompts" / f"{name}.md").read_text(encoding="utf-8")
-    return (
-        text.replace("{commit_sha}", COMMIT_SHA)
-        .replace("{repository_url}", REPOSITORY_URL)
-        .replace("{historical_context}", HISTORICAL_CONTEXT)
-    )
+    return (HERE / "prompts" / f"{name}.md").read_text(encoding="utf-8")
 
 
-def role_agent(role: str, **kwargs: Any):
+def role_agent(config: BugfinderConfig, role: str, **kwargs: Any):
     """Choose Codex, Claude Code, or Pi/OpenRouter independently per role."""
 
-    selected = os.environ.get(
+    selected = config.setting(
         f"BUGFINDER_{role.upper()}_AGENT",
-        os.environ.get("BUGFINDER_AGENT", "codex"),
+        config.setting("BUGFINDER_AGENT", "codex"),
     ).lower()
     builders: dict[str, Callable[..., Any]] = {"codex": codex, "claude": claude, "pi": pi}
     if selected not in builders:
         raise ValueError(f"unsupported {role} agent {selected!r}; choose codex, claude, or pi")
     kwargs.setdefault("connectors", ["bugdb"])
     kwargs.setdefault("concurrency_pool", f"{selected}-provider")
-    kwargs.setdefault("durable_goal", {"mode": os.environ.get("BUGFINDER_GOAL_MODE", "supervised")})
-    kwargs.setdefault("retries", int(os.environ.get("BUGFINDER_RETRIES", "1")))
+    if role == "hunt":
+        kwargs.setdefault(
+            "durable_goal",
+            {"mode": config.setting("BUGFINDER_GOAL_MODE", "supervised")},
+        )
+    retryable = role in {"hunt", "triage", "rereview"}
+    kwargs.setdefault(
+        "retries",
+        int(config.setting("BUGFINDER_RETRIES", "1")) if retryable else 0,
+    )
     kwargs.setdefault("retry_backoff_seconds", 2)
-    kwargs.setdefault("timeout_seconds", int(os.environ.get("BUGFINDER_NODE_TIMEOUT", "1800")))
+    kwargs.setdefault("timeout_seconds", int(config.setting("BUGFINDER_NODE_TIMEOUT", "1800")))
+    kwargs.setdefault("repo_instructions_mode", "ignore")
     if selected == "codex":
-        kwargs["model"] = os.environ.get("BUGFINDER_CODEX_MODEL", "gpt-5.6-luna")
-    elif selected == "claude" and os.environ.get("BUGFINDER_CLAUDE_MODEL"):
-        kwargs["model"] = os.environ["BUGFINDER_CLAUDE_MODEL"]
+        kwargs["model"] = config.setting("BUGFINDER_CODEX_MODEL", "gpt-5.6-luna")
+    elif selected == "claude" and config.environment.get("BUGFINDER_CLAUDE_MODEL"):
+        kwargs["model"] = config.environment["BUGFINDER_CLAUDE_MODEL"]
     elif selected == "pi":
-        kwargs["model"] = os.environ.get(
+        kwargs["model"] = config.setting(
             "BUGFINDER_PI_MODEL",
             "openrouter/anthropic/claude-sonnet-4.6",
         )
@@ -90,201 +110,221 @@ def requires_tool(name: str) -> list[dict[str, str]]:
     return [{"kind": "connector_tool_called", "connector": "bugdb", "tool": name}]
 
 
-HUNT_ITEM = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["callerKey", "kind", "objective", "paths"],
-    "properties": {
-        "callerKey": {"type": "string", "minLength": 1, "maxLength": 256},
-        "kind": {"enum": ["FILE", "THREAT_MODEL", "ROAM"]},
-        "objective": {"type": "string", "minLength": 1},
-        "paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    },
-}
-LEAD_INPUT = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["callerKey", "claim", "locations", "evidence"],
-    "properties": {
-        "callerKey": {"type": "string", "minLength": 1, "maxLength": 256},
-        "claim": {"type": "string", "minLength": 1},
-        "locations": {
-            "type": "array",
-            "minItems": 1,
-            "items": {"type": "string", "minLength": 1},
-        },
-        "evidence": {"type": "string", "minLength": 1},
-        "attackerPreconditions": {"type": "string", "minLength": 1},
-        "impact": {"type": "string", "minLength": 1},
-        "validationPlan": {"type": "string", "minLength": 1},
-    },
-}
-FINDING_ITEM = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["callerKey", "title", "rootCause", "impact", "leadIds"],
-    "properties": {
-        "callerKey": {"type": "string", "minLength": 1, "maxLength": 256},
-        "title": {"type": "string", "minLength": 1},
-        "rootCause": {"type": "string", "minLength": 1},
-        "impact": {"type": "string", "minLength": 1},
-        "leadIds": {
-            "type": "array",
-            "minItems": 1,
-            "items": {"type": "string", "minLength": 1},
-        },
-    },
-}
-REVIEW_INPUT = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["verdict", "assessment"],
-    "properties": {
-        "verdict": {"enum": ["CONFIRMED", "REJECTED", "INCONCLUSIVE"]},
-        "assessment": {"type": "string", "minLength": 1},
-    },
-}
+REPORT_CODE = r'''import json
+import os
+import urllib.request
 
-CONNECTOR_TOOLS = [
-    {
-        "name": "add_hunts",
-        "description": "Insert selected Hunts into the injected run using stable caller keys.",
-        "input_schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["hunts"],
-            "properties": {"hunts": {"type": "array", "items": HUNT_ITEM}},
+urls = json.loads(os.environ["AGENTFLOW_CONNECTOR_URLS"])
+all_headers = json.loads(os.environ["AGENTFLOW_CONNECTOR_HEADERS"])
+url = urls["bugdb"].removesuffix("/mcp") + "/tools/call"
+headers = all_headers["bugdb"]
+headers["content-type"] = "application/json"
+request = urllib.request.Request(
+    url,
+    data=json.dumps({"name": "get_finding", "arguments": {}}).encode(),
+    headers=headers,
+    method="POST",
+)
+with urllib.request.urlopen(request) as response:
+    finding = json.loads(response.read())["result"]
+
+def required_text(value, label):
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"Finding report requires {label}")
+    return value.strip()
+
+triage = required_text(finding.get("triageVerdict"), "triage")
+rereview = required_text(finding.get("rereviewVerdict"), "re-review")
+disposition = required_text(finding.get("disposition"), "derived disposition")
+if disposition not in {"CONFIRMED", "REJECTED", "INCONCLUSIVE"}:
+    raise RuntimeError("BugDB returned an invalid derived disposition")
+
+leads = finding.get("leads")
+if not isinstance(leads, list) or not leads:
+    raise RuntimeError("Finding report requires at least one Lead")
+evidence = []
+validation_plans = []
+for index, lead in enumerate(leads, start=1):
+    hunt = lead.get("hunt") or {}
+    section = [
+        f"### Lead {index} ({required_text(hunt.get('kind'), 'Hunt kind')})",
+        f"**Claim:** {required_text(lead.get('claim'), 'Lead claim')}",
+        f"**Locations:** {', '.join(lead.get('locations') or [])}",
+        f"**Evidence:** {required_text(lead.get('evidence'), 'Lead evidence')}",
+    ]
+    for key, label in (
+        ("attackerPreconditions", "Attacker preconditions"),
+        ("impact", "Lead impact"),
+        ("validationPlan", "Validation"),
+    ):
+        value = lead.get(key)
+        if isinstance(value, str) and value.strip():
+            section.append(f"**{label}:** {value.strip()}")
+            if key == "validationPlan":
+                validation_plans.append(value.strip())
+    evidence.append("\n\n".join(section))
+
+report = "\n\n".join([
+    f"# {required_text(finding.get('title'), 'title')}",
+    f"**Disposition:** {disposition}",
+    "## Impact",
+    required_text(finding.get("impact"), "impact"),
+    "## Root cause",
+    required_text(finding.get("rootCause"), "root cause"),
+    "## Reviews",
+    f"**Triage ({triage}):** {required_text(finding.get('triageAssessment'), 'triage assessment')}",
+    f"**Independent re-review ({rereview}):** "
+    f"{required_text(finding.get('rereviewAssessment'), 're-review assessment')}",
+    "## Evidence",
+    "\n\n".join(evidence),
+    "## Validation guidance",
+    "\n".join(f"- {plan}" for plan in validation_plans)
+    or "Reproduce the stated evidence against the pinned source commit.",
+    "## Remediation",
+    "Address the stated root cause, then repeat the validation guidance above.",
+]).strip() + "\n"
+print(report, end="")
+'''
+
+
+def bugdb_connector() -> dict[str, Any]:
+    return {
+        "name": "bugdb",
+        "url": "http://127.0.0.1:{port}/mcp",
+        "control_url": "http://127.0.0.1:{port}/orchestration",
+        "command": "npm",
+        "args": ["run", "connector"],
+        "cwd": str(HERE),
+        "env": {"BUGDB_PORT": "{port}"},
+        "env_from": {"DATABASE_URL": "DATABASE_URL"},
+    }
+
+
+def build_pipeline(config: BugfinderConfig) -> Graph:
+    with Graph(
+        "bugfinder",
+        description="Single-commit Mythos-style and threat-model-driven bug finding",
+        working_dir=str(config.repository),
+        source_snapshot={
+            "repositoryUrl": config.repository_url,
+            "inputRef": config.input_ref,
         },
-    },
-    {"name": "get_hunt", "description": "Read the injected Hunt and Leads.", "input_schema": {"type": "object", "additionalProperties": False}},
-    {"name": "add_lead", "description": "Append one immutable Lead to the injected Hunt.", "input_schema": LEAD_INPUT},
-    {
-        "name": "finish_hunt",
-        "description": "Set the injected Hunt result exactly once.",
-        "input_schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["result", "resultSummary"],
-            "properties": {
-                "result": {"enum": ["BUG_FOUND", "EXHAUSTED", "BLOCKED"]},
-                "resultSummary": {"type": "string", "minLength": 1},
+        concurrency=int(config.setting("BUGFINDER_CONCURRENCY", "24")),
+        deadline_seconds=int(config.setting("BUGFINDER_DEADLINE_SECONDS", "14400")),
+        fail_fast=False,
+        concurrency_pools={
+            "codex-provider": int(config.setting("BUGFINDER_CODEX_CONCURRENCY", "12")),
+            "claude-provider": int(config.setting("BUGFINDER_CLAUDE_CONCURRENCY", "8")),
+            "pi-provider": int(config.setting("BUGFINDER_PI_CONCURRENCY", "12")),
+        },
+        connectors=[bugdb_connector()],
+    ) as graph:
+        rank_files = role_agent(
+            config,
+            "rank",
+            task_id="rank_files",
+            prompt=prompt("rank"),
+            connector_tools={"bugdb": ["add_hunts"]},
+            success_criteria=requires_tool("add_hunts"),
+        )
+        threat_model = role_agent(
+            config,
+            "threat",
+            task_id="threat_model",
+            prompt=prompt("threat"),
+            input={
+                "repositoryUrl": config.repository_url,
+                "historicalContext": config.historical_context,
             },
-        },
-    },
-    {"name": "list_hunts_and_leads", "description": "Read all Hunts and Leads in the injected run.", "input_schema": {"type": "object", "additionalProperties": False}},
-    {
-        "name": "create_findings",
-        "description": "Create Findings and assign same-run Leads transactionally.",
-        "input_schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["findings"],
-            "properties": {"findings": {"type": "array", "items": FINDING_ITEM}},
-        },
-    },
-    {"name": "get_finding", "description": "Read the injected Finding and its complete Lead provenance.", "input_schema": {"type": "object", "additionalProperties": False}},
-    {"name": "set_triage", "description": "Set triage once on the injected Finding.", "input_schema": REVIEW_INPUT},
-    {"name": "set_rereview", "description": "Set independent re-review once on the injected Finding.", "input_schema": REVIEW_INPUT},
-]
+            connector_tools={"bugdb": ["add_hunts"]},
+            success_criteria=requires_tool("add_hunts"),
+        )
+        roam_plan = role_agent(
+            config,
+            "roam",
+            task_id="roam_plan",
+            prompt=prompt("roam"),
+            connector_tools={"bugdb": ["add_hunts"]},
+            success_criteria=requires_tool("add_hunts"),
+        )
 
-with Graph(
-    "bugfinder",
-    description="Single-commit Mythos-style and threat-model-driven bug finding",
-    working_dir=str(REPOSITORY),
-    source_snapshot={
-        "repositoryUrl": REPOSITORY_URL,
-        "inputRef": INPUT_REF,
-        "commitSha": COMMIT_SHA,
-    },
-    concurrency=int(os.environ.get("BUGFINDER_CONCURRENCY", "24")),
-    fail_fast=False,
-    concurrency_pools={
-        "codex-provider": int(os.environ.get("BUGFINDER_CODEX_CONCURRENCY", "12")),
-        "claude-provider": int(os.environ.get("BUGFINDER_CLAUDE_CONCURRENCY", "8")),
-        "pi-provider": int(os.environ.get("BUGFINDER_PI_CONCURRENCY", "12")),
-    },
-    connectors=[
-        {
-            "name": "bugdb",
-            "url": f"http://127.0.0.1:{BUGDB_PORT}/mcp",
-            "control_url": f"http://127.0.0.1:{BUGDB_PORT}/orchestration",
-            "command": "npm",
-            "args": ["run", "connector"],
-            "cwd": str(HERE),
-            "env": {"BUGDB_PORT": str(BUGDB_PORT)},
-            "env_from": {"DATABASE_URL": "DATABASE_URL"},
-            "tools": CONNECTOR_TOOLS,
-        }
-    ],
-) as graph:
-    rank_files = role_agent(
-        "rank", task_id="rank_files", prompt=prompt("rank"), success_criteria=requires_tool("add_hunts")
-    )
-    threat_model = role_agent(
-        "threat", task_id="threat_model", prompt=prompt("threat"), success_criteria=requires_tool("add_hunts")
-    )
-    roam_plan = role_agent(
-        "roam", task_id="roam_plan", prompt=prompt("roam"), success_criteria=requires_tool("add_hunts")
-    )
+        hunt = fanout_from(
+            role_agent(
+                config,
+                "hunt",
+                task_id="hunt",
+                prompt=prompt("hunt"),
+                connector_tools={"bugdb": ["get_hunt", "add_lead", "finish_hunt"]},
+                success_criteria=requires_tool("finish_hunt"),
+            ),
+            rank_files,
+            connector="bugdb",
+            resource="hunts",
+            as_="hunt",
+            max_items=500,
+        )
+        threat_model >> hunt
+        roam_plan >> hunt
 
-    hunt = fanout_from(
-        role_agent(
-            "hunt", task_id="hunt", prompt=prompt("hunt"), success_criteria=requires_tool("finish_hunt")
-        ),
-        rank_files,
-        connector="bugdb",
-        resource="hunts",
-        as_="hunt",
-        max_items=500,
-    )
-    threat_model >> hunt
-    roam_plan >> hunt
+        deduplicate = role_agent(
+            config,
+            "deduplicate",
+            task_id="deduplicate",
+            prompt=prompt("deduplicate"),
+            connector_tools={"bugdb": ["list_hunts_and_leads", "create_findings"]},
+            success_criteria=requires_tool("create_findings"),
+        )
+        hunt >> deduplicate
 
-    deduplicate = role_agent(
-        "deduplicate",
-        task_id="deduplicate",
-        prompt=prompt("deduplicate"),
-        success_criteria=requires_tool("create_findings"),
-    )
-    hunt >> deduplicate
+        triage = fanout_from(
+            role_agent(
+                config,
+                "triage",
+                task_id="triage",
+                prompt=prompt("triage"),
+                connector_tools={"bugdb": ["get_finding", "set_triage"]},
+                success_criteria=requires_tool("set_triage"),
+            ),
+            deduplicate,
+            connector="bugdb",
+            resource="findings",
+            as_="finding",
+            max_items=500,
+        )
+        rereview = fanout_from(
+            role_agent(
+                config,
+                "rereview",
+                task_id="rereview",
+                prompt=prompt("rereview"),
+                connector_tools={"bugdb": ["get_finding", "set_rereview"]},
+                success_criteria=requires_tool("set_rereview"),
+            ),
+            triage,
+            connector="bugdb",
+            resource="findings",
+            as_="finding",
+            max_items=500,
+        )
+        fanout_from(
+            python_node(
+                task_id="report",
+                code=REPORT_CODE,
+                connectors=["bugdb"],
+                connector_tools={"bugdb": ["get_finding"]},
+                repo_instructions_mode="ignore",
+                capture="trace",
+                output_artifact="report.md",
+                success_criteria=[{"kind": "output_regex", "value": r"\S"}],
+            ),
+            rereview,
+            connector="bugdb",
+            resource="findings",
+            as_="finding",
+            max_items=500,
+        )
+    return graph
 
-    triage = fanout_from(
-        role_agent(
-            "triage", task_id="triage", prompt=prompt("triage"), success_criteria=requires_tool("set_triage")
-        ),
-        deduplicate,
-        connector="bugdb",
-        resource="findings",
-        as_="finding",
-        max_items=500,
-    )
-    rereview = fanout_from(
-        role_agent(
-            "rereview",
-            task_id="rereview",
-            prompt=prompt("rereview"),
-            success_criteria=requires_tool("set_rereview"),
-        ),
-        triage,
-        connector="bugdb",
-        resource="findings",
-        as_="finding",
-        max_items=500,
-    )
-    fanout_from(
-        role_agent(
-            "report",
-            task_id="report",
-            prompt=prompt("report"),
-            output_artifact="report.md",
-            success_criteria=requires_tool("get_finding"),
-        ),
-        rereview,
-        connector="bugdb",
-        resource="findings",
-        as_="finding",
-        max_items=500,
-    )
 
-pipeline = graph
-print(pipeline.to_json())
+if __name__ == "__main__":
+    print(build_pipeline(BugfinderConfig.from_environment()).to_json())

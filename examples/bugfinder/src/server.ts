@@ -36,6 +36,7 @@ function requiredEnv(name: string): string {
 const runId = requiredEnv("AGENTFLOW_RUN_ID");
 const contextSecret = requiredEnv("AGENTFLOW_CONTEXT_SECRET");
 const controlToken = requiredEnv("AGENTFLOW_CONTROL_TOKEN");
+const connectorNonce = requiredEnv("AGENTFLOW_CONNECTOR_NONCE");
 
 const prisma = new PrismaClient();
 
@@ -113,6 +114,12 @@ function safeTokenEqual(actual: string | undefined, expected: string): boolean {
 }
 
 function scopeFromHeaders(headers: Headers): BugDbScope {
+  const requestRunId = header(headers, "x-agentflow-run-id");
+  const runSignature = header(headers, "x-agentflow-run-signature");
+  const expectedRunSignature = createHmac("sha256", contextSecret).update(runId).digest("hex");
+  if (requestRunId !== runId || !safeTokenEqual(runSignature, expectedRunSignature)) {
+    throw new Error("invalid AgentFlow run scope");
+  }
   const itemId = header(headers, "x-agentflow-item-id");
   const signature = header(headers, "x-agentflow-item-signature");
   if (itemId === undefined && signature === undefined) return { runId };
@@ -128,6 +135,24 @@ function scopeFromHeaders(headers: Headers): BugDbScope {
   return { runId, itemId };
 }
 
+function toolScopeFromHeaders(headers: Headers): Set<ToolName> {
+  if (safeTokenEqual(header(headers, "x-agentflow-control-token"), controlToken)) {
+    return new Set(Object.keys(tools) as ToolName[]);
+  }
+  const scope = header(headers, "x-agentflow-tool-scope");
+  const signature = header(headers, "x-agentflow-tool-signature");
+  if (scope === undefined || !signature) throw new Error("missing AgentFlow tool scope");
+  const expected = createHmac("sha256", contextSecret)
+    .update(runId)
+    .update("\0tools\0")
+    .update(scope)
+    .digest("hex");
+  if (!safeTokenEqual(signature, expected)) throw new Error("invalid AgentFlow tool scope");
+  const names = scope === "" ? [] : scope.split(",");
+  if (names.some((name) => !(name in tools))) throw new Error("unknown AgentFlow tool scope");
+  return new Set(names as ToolName[]);
+}
+
 function toolResult(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
 }
@@ -135,13 +160,17 @@ function toolResult(value: unknown) {
 async function callTool(name: string, raw: unknown, headers: Headers) {
   const tool = tools[name as ToolName];
   if (!tool) throw new Error(`unknown tool ${name}`);
+  if (!toolScopeFromHeaders(headers).has(name as ToolName)) {
+    throw new Error(`tool ${name} is not allowed in this node`);
+  }
   const input = tool.inputSchema.parse(raw);
   return tool.run(scopeFromHeaders(headers), input as never);
 }
 
-function buildMcpServer() {
+function buildMcpServer(allowedTools: Set<ToolName>) {
   const server = new McpServer({ name: "agentflow-bugdb", version: "0.1.0" });
   for (const [name, tool] of Object.entries(tools)) {
+    if (!allowedTools.has(name as ToolName)) continue;
     server.registerTool(
       name,
       {
@@ -172,6 +201,15 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 
 const app = createMcpExpressApp({ host });
 
+app.use("/mcp", (request, response, next) => {
+  try {
+    scopeFromHeaders(request.headers as Headers);
+    next();
+  } catch {
+    response.status(403).json({ error: "invalid AgentFlow run scope" });
+  }
+});
+
 type McpSession = { server: McpServer; transport: StreamableHTTPServerTransport };
 const sessions = new Map<string, McpSession>();
 
@@ -184,7 +222,7 @@ app.post("/mcp", async (request, response) => {
     const id = sessionId(request.headers["mcp-session-id"]);
     let session = id ? sessions.get(id) : undefined;
     if (!session && !id && isInitializeRequest(request.body)) {
-      const server = buildMcpServer();
+      const server = buildMcpServer(toolScopeFromHeaders(request.headers as Headers));
       let createdSession!: McpSession;
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: randomUUID,
@@ -260,19 +298,33 @@ app.get("/orchestration/:resource", async (request, response) => {
     return;
   }
   if (request.params.resource === "hunts") {
-    const hunts = await prisma.hunt.findMany({ where: { runId }, select: { id: true }, orderBy: { createdAt: "asc" } });
+    const hunts = await prisma.hunt.findMany({
+      where: { runId },
+      select: { id: true },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    });
     response.json(hunts.map((hunt) => hunt.id));
     return;
   }
   if (request.params.resource === "findings") {
-    const findings = await prisma.finding.findMany({ where: { runId }, select: { id: true }, orderBy: { createdAt: "asc" } });
+    const findings = await prisma.finding.findMany({
+      where: { runId },
+      select: { id: true },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    });
     response.json(findings.map((finding) => finding.id));
     return;
   }
   response.status(404).json({ error: "unknown orchestration resource" });
 });
 
-app.get("/healthz", (_request, response) => response.json({ ok: true, runId }));
+app.get("/healthz", (request, response) => {
+  if (!safeTokenEqual(header(request.headers as Headers, "x-agentflow-control-token"), controlToken)) {
+    response.status(403).json({ error: "invalid AgentFlow control token" });
+    return;
+  }
+  response.json({ ok: true, runId, nonce: connectorNonce });
+});
 
 const httpServer = app.listen(port, host, () => {
   process.stdout.write(`BugDB connector listening on http://${host}:${port}/mcp for run ${runId}\n`);

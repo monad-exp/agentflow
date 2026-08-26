@@ -1,0 +1,77 @@
+name: Bugfinder
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e '.[dev]'
+      - run: >-
+          pytest -q
+          tests/test_agents.py
+          tests/test_context.py
+          tests/test_dsl.py
+          tests/test_loader.py
+          tests/test_orchestrator.py
+          tests/test_pipeline_paths.py
+          tests/test_prepared.py
+          tests/test_runners.py
+          tests/test_runtime_workflows.py
+          tests/test_store_and_validation.py
+          tests/test_success.py
+          tests/test_traces.py
+          tests/test_connectors.py
+          tests/test_utility_agents.py
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: agentflow_test
+          POSTGRES_DB: bugfinder_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d bugfinder_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      BUGFINDER_TEST_DATABASE_URL: postgresql://agentflow_bugdb_login:agentflow_app_test@127.0.0.1:5432/bugfinder_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: examples/bugfinder/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci --prefix examples/bugfinder
+      - run: npm run build --prefix examples/bugfinder
+      - name: Migrate and create the application login
+        env:
+          DATABASE_URL: postgresql://postgres:agentflow_test@127.0.0.1:5432/bugfinder_test
+          PGPASSWORD: agentflow_test
+        run: |
+          npm run prisma:migrate --prefix examples/bugfinder
+          psql -h 127.0.0.1 -U postgres -d bugfinder_test \
+            -c "CREATE ROLE agentflow_bugdb_login LOGIN PASSWORD 'agentflow_app_test' IN ROLE agentflow_bugdb_app"
+      - name: TypeScript integration tests
+        env:
+          DATABASE_URL: ${{ env.BUGFINDER_TEST_DATABASE_URL }}
+        run: npm test --prefix examples/bugfinder
+      - run: python -m pip install -e '.[dev]'
+      - name: Database-backed workflow tests
+        run: pytest -q tests/test_bugfinder*.py

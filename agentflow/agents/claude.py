@@ -38,6 +38,8 @@ class ClaudeAdapter(AgentAdapter):
         provider = self.provider_config(node.provider, node.agent)
         executable = node.executable or "claude"
         repo_instructions_ignored = node.repo_instructions_mode == RepoInstructionsMode.IGNORE
+        if repo_instructions_ignored:
+            prompt = self.source_checkout_prompt(prompt, paths)
         command = [
             executable,
             "-p",

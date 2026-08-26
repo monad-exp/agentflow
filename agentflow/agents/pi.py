@@ -76,20 +76,22 @@ class PiAdapter(AgentAdapter):
             command.extend(["--model", node.model])
 
         if repo_instructions_ignored:
-            command.extend(["--no-skills", "--no-extensions", "--no-prompt-templates"])
+            command.extend([
+                "--no-skills",
+                "--no-extensions",
+                "--no-prompt-templates",
+                "--no-context-files",
+            ])
+            prompt = self.source_checkout_prompt(prompt, paths)
 
         command.extend(node.extra_args)
-
-        cwd = paths.target_workdir
-        if repo_instructions_ignored:
-            cwd = str(Path(paths.target_runtime_dir))
 
         # Pass the prompt via stdin so it is never parsed as a flag or `@file`
         # reference by Pi's positional-message argument handling.
         return PreparedExecution(
             command=command,
             env=env,
-            cwd=cwd,
+            cwd=paths.target_workdir,
             trace_kind="pi",
             runtime_files=runtime_files,
             stdin=prompt,

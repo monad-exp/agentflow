@@ -10,10 +10,12 @@
     "@hono/node-server": "1.19.15"
   },
   "scripts": {
+    "prebuild": "npm run prisma:generate",
     "build": "tsc --noEmit",
     "connector": "tsx src/server.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",
+    "pretest": "npm run prisma:generate",
     "test": "vitest run",
     "test:integration": "vitest run test/bugdb.integration.test.ts"
   },
