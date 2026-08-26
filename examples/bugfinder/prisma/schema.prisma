@@ -1,0 +1,77 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum HuntKind {
+  FILE
+  THREAT_MODEL
+  ROAM
+}
+
+enum HuntResult {
+  BUG_FOUND
+  EXHAUSTED
+  BLOCKED
+}
+
+enum FindingVerdict {
+  CONFIRMED
+  REJECTED
+  INCONCLUSIVE
+}
+
+model Hunt {
+  id            String      @id
+  runId         String      @map("run_id")
+  kind          HuntKind
+  objective     String      @db.Text
+  paths         String[]
+  result        HuntResult?
+  resultSummary String?     @map("result_summary") @db.Text
+  createdAt     DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  leads         Lead[]
+
+  @@index([runId, kind])
+  @@map("hunts")
+}
+
+model Lead {
+  id                    String   @id
+  huntId                String   @map("hunt_id")
+  findingId             String?  @map("finding_id")
+  claim                 String   @db.Text
+  locations             String[]
+  evidence              String   @db.Text
+  attackerPreconditions String?  @map("attacker_preconditions") @db.Text
+  impact                String?  @db.Text
+  validationPlan        String?  @map("validation_plan") @db.Text
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  hunt                  Hunt     @relation(fields: [huntId], references: [id], onDelete: Restrict)
+  finding               Finding? @relation(fields: [findingId], references: [id], onDelete: Restrict)
+
+  @@index([huntId])
+  @@index([findingId])
+  @@map("leads")
+}
+
+model Finding {
+  id                 String          @id
+  runId              String          @map("run_id")
+  title              String          @db.Text
+  rootCause          String          @map("root_cause") @db.Text
+  impact             String          @db.Text
+  triageVerdict      FindingVerdict? @map("triage_verdict")
+  triageAssessment   String?         @map("triage_assessment") @db.Text
+  rereviewVerdict    FindingVerdict? @map("rereview_verdict")
+  rereviewAssessment String?         @map("rereview_assessment") @db.Text
+  createdAt          DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  leads              Lead[]
+
+  @@index([runId])
+  @@map("findings")
+}

@@ -74,6 +74,87 @@ print(g.to_json())
 
 Reduce with `merge(node, source, size=N)` (batch) or `merge(node, source, by=["field"])` (group).
 
+When the collection is produced by an agent, use `fanout_from()`. The source
+must return JSON; AgentFlow validates the output, materializes workers at run
+time, and treats the template node as an all-terminal fan-in barrier:
+
+```python
+from agentflow import Graph, codex, fanout_from
+
+with Graph("runtime-review", concurrency=16) as g:
+    rank = codex(
+        task_id="rank",
+        prompt='Return {"targets":[{"path":"api.py"}]}.',
+        output_schema={"type": "object", "required": ["targets"]},
+    )
+    review = fanout_from(
+        codex(
+            task_id="review",
+            prompt="Review the one structured-input target.",
+            input_schema={"type": "object", "required": ["path"]},
+        ),
+        rank,
+        path="targets",
+        max_items=500,
+    )
+```
+
+For durable handoffs, source the collection from a run-scoped connector instead
+of agent output. AgentFlow waits for the source dependencies, reads stable IDs
+through the connector's protected control endpoint, and injects a signed item
+scope into each worker without adding the domain payload to its prompt:
+
+```python
+hunt = fanout_from(
+    codex(task_id="hunt", prompt="Call bugdb.get_hunt with no ID.", connectors=["bugdb"]),
+    planning,
+    connector="bugdb",
+    resource="hunts",
+)
+```
+
+Use top-level `concurrency_pools={"codex-provider": 8}` with a node's
+`concurrency_pool="codex-provider"` to cap a provider independently of global
+graph concurrency.
+
+## Run-scoped Connectors
+
+Top-level connectors let AgentFlow own a tool service once per run and inject
+the same logical tools into Codex and Claude over MCP and into Pi through a
+generated extension:
+
+```python
+with Graph(
+    "database-backed-review",
+    connectors=[{
+        "name": "bugdb",
+        "url": "http://127.0.0.1:4312/mcp",
+        "control_url": "http://127.0.0.1:4312/orchestration",
+        "command": "npm",
+        "args": ["run", "connector"],
+        "cwd": "examples/bugfinder",
+        "env_from": {"DATABASE_URL": "DATABASE_URL"},
+        "tools": [{
+            "name": "list_hunts_and_leads",
+            "description": "List durable messages for the injected run",
+            "input_schema": {"type": "object"},
+        }],
+    }],
+) as g:
+    codex(task_id="deduplicate", prompt="Merge related leads.", connectors=["bugdb"])
+```
+
+Only explicitly declared connector environment is passed to the connector.
+Connector credential names are removed from local agent subprocesses, and the
+service is terminated when the run ends.
+
+Set `source_snapshot={"repositoryUrl": ..., "inputRef": ..., "commitSha": ...}`
+to persist resolved source identity before analysis. Nodes may also declare
+`durable_goal={"mode": "supervised"}` so retries write checkpoint artifacts and
+resume from connector state, or `mode="native"` for executors with `/goal`
+support. `output_artifact="report.md"` stores a node's final response as an
+additional named AgentFlow artifact.
+
 ## Iterative Cycles
 
 Loop until a stop condition with `on_failure`:

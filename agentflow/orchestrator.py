@@ -19,6 +19,8 @@ from typing import Any, Callable
 from pydantic import BaseModel, Field, ValidationError
 
 from agentflow.agents.registry import AdapterRegistry, default_adapter_registry
+from agentflow.connectors import ConnectorManager
+from agentflow.contracts import parse_json_output, select_json_path, validate_json_contract
 from agentflow.context import render_node_prompt
 from agentflow.graph_optimizer import (
     GRAPH_OPTIMIZER_MAX_ATTEMPTS,
@@ -43,6 +45,7 @@ from agentflow.specs import (
     AgentKind,
     NodeAttempt,
     NodeResult,
+    NodeSpec,
     NodeStatus,
     PeriodicActuationMode,
     PipelineSpec,
@@ -51,6 +54,7 @@ from agentflow.specs import (
     RunRecord,
     RunStatus,
     builtin_agent_kind,
+    expand_runtime_fanout_node,
 )
 from agentflow.store import RunStore
 from agentflow.success import evaluate_success
@@ -62,6 +66,7 @@ from agentflow.utils import ensure_dir, looks_sensitive_key, redact_sensitive_sh
 _TERMINAL_NODE_STATUSES = {
     NodeStatus.COMPLETED,
     NodeStatus.FAILED,
+    NodeStatus.TIMED_OUT,
     NodeStatus.SKIPPED,
     NodeStatus.CANCELLED,
 }
@@ -92,6 +97,7 @@ class _PeriodicNodeRuntimeState:
     next_tick_at: float | None = None
     last_tick_started_at: str | None = None
     last_tick_started_mono: float | None = None
+    waiting_for_actuation: bool = False
 
 
 @dataclass(slots=True)
@@ -113,6 +119,7 @@ class Orchestrator:
     _node_cancel_flags: dict[str, set[str]] = field(default_factory=dict, init=False, repr=False)
     _pending_node_reruns: dict[str, set[str]] = field(default_factory=dict, init=False, repr=False)
     _scratchboards: dict[str, "Scratchboard"] = field(default_factory=dict, init=False, repr=False)
+    _connector_manager: ConnectorManager = field(default_factory=ConnectorManager, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._run_slots = threading.Semaphore(self.max_concurrent_runs)
@@ -139,6 +146,7 @@ class Orchestrator:
         node_result.status = NodeStatus.PENDING
         node_result.finished_at = None
         node_result.output = None
+        node_result.structured_output = None
         node_result.exit_code = None
         node_result.success = None
         node_result.success_details = []
@@ -268,6 +276,54 @@ class Orchestrator:
                 result.finished_at = finished_at
                 await self._publish(run_id, "node_skipped", node_id=node_id, reason="inference_setup_failed")
         await self._publish(run_id, "inference_failed", error=str(exc))
+        await self._publish(run_id, "run_completed", status=record.status.value)
+        await self.store.clear_cancel_request(run_id)
+        await self.store.persist_run(run_id)
+        self._node_cancel_flags.pop(run_id, None)
+        self._pending_node_reruns.pop(run_id, None)
+        return record
+
+    async def _prepare_connectors(self, run_id: str, record: RunRecord) -> None:
+        if not record.pipeline.connectors:
+            return
+        await self._publish(
+            run_id,
+            "connectors_starting",
+            connectors=[connector.name for connector in record.pipeline.connectors],
+        )
+        await self._connector_manager.start(
+            run_id,
+            record.pipeline,
+            self.store.run_dir(run_id),
+        )
+        await self._publish(
+            run_id,
+            "connectors_ready",
+            connectors=[connector.name for connector in record.pipeline.connectors],
+        )
+        await self.store.persist_run(run_id)
+
+    async def _persist_source_snapshot(self, run_id: str, record: RunRecord) -> None:
+        snapshot = record.pipeline.source_snapshot
+        if snapshot is None:
+            return
+        record.source_snapshot = snapshot.model_copy(deep=True)
+        payload = snapshot.model_dump(mode="json", by_alias=True)
+        await self.store.write_run_artifact_json(run_id, "source-snapshot.json", payload)
+        await self._publish(run_id, "source_snapshot_persisted", source_snapshot=payload)
+        await self.store.persist_run(run_id)
+
+    async def _fail_connector_setup(self, run_id: str, exc: Exception) -> RunRecord:
+        record = self.store.get_run(run_id)
+        finished_at = utcnow_iso()
+        record.status = RunStatus.FAILED
+        record.finished_at = finished_at
+        for node_id, result in record.nodes.items():
+            if result.status in {NodeStatus.PENDING, NodeStatus.QUEUED, NodeStatus.READY}:
+                result.status = NodeStatus.SKIPPED
+                result.finished_at = finished_at
+                await self._publish(run_id, "node_skipped", node_id=node_id, reason="connector_setup_failed")
+        await self._publish(run_id, "connectors_failed", error=str(exc))
         await self._publish(run_id, "run_completed", status=record.status.value)
         await self.store.clear_cancel_request(run_id)
         await self.store.persist_run(run_id)
@@ -1003,6 +1059,35 @@ class Orchestrator:
             current_tick_number=periodic_tick_number,
             current_tick_started_at=periodic_tick_started_at,
         )
+        contract_input = node.input
+        if node.input_schema is not None:
+            input_errors = validate_json_contract(
+                contract_input,
+                node.input_schema,
+                label=f"node {node.id!r} input",
+            )
+            if input_errors:
+                result.status = NodeStatus.FAILED
+                result.success = False
+                result.success_details = input_errors
+                result.finished_at = utcnow_iso()
+                await self._publish(
+                    run_id,
+                    "node_failed",
+                    node_id=node_id,
+                    success=False,
+                    success_details=input_errors,
+                )
+                await self.store.write_artifact_text(run_id, node_id, "output.txt", "")
+                await self.store.write_artifact_json(run_id, node_id, "result.json", result.model_dump(mode="json"))
+                await self.store.persist_run(run_id)
+                return _NodeExecutionOutcome(node_id=node_id, periodic_tick_number=periodic_tick_number)
+        if contract_input is not None:
+            prompt += (
+                "\n\nAgentFlow structured input (JSON):\n```json\n"
+                + json.dumps(contract_input, ensure_ascii=False, indent=2)
+                + "\n```"
+            )
         execution_resolution = resolve_node_for_execution(node, pipeline.working_path)
         execution_node = execution_resolution.node
         runtime_agent = execution_resolution.runtime_agent
@@ -1026,6 +1111,16 @@ class Orchestrator:
                         model=execution_node.model, capture=execution_node.capture, env=execution_node.env,
                         extra_args=execution_node.extra_args, provider=execution_node.provider,
                         mcps=execution_node.mcps, skills=execution_node.skills, schedule=execution_node.schedule,
+                        connectors=execution_node.connectors,
+                        connector_bindings=execution_node.connector_bindings,
+                        connector_secret_env=execution_node.connector_secret_env,
+                        input=execution_node.input,
+                        input_schema=execution_node.input_schema,
+                        output_schema=execution_node.output_schema,
+                        output_artifact=execution_node.output_artifact,
+                        concurrency_pool=execution_node.concurrency_pool,
+                        durable_goal=execution_node.durable_goal,
+                        fanout_from=execution_node.fanout_from,
                         fanout_group=execution_node.fanout_group, fanout_member=execution_node.fanout_member,
                         on_failure_restart=execution_node.on_failure_restart,
                         fanout_dependencies=getattr(execution_node, 'fanout_dependencies', {}),
@@ -1065,7 +1160,16 @@ class Orchestrator:
             result.current_attempt = attempt_number
             result.attempts.append(attempt)
             parser.start_attempt(attempt_number)
-            prepared = adapter.prepare(execution_node, prompt, paths)
+            attempt_prompt = prompt
+            if execution_node.durable_goal is not None:
+                if execution_node.durable_goal.mode == "native":
+                    attempt_prompt = "/goal\n\n" + attempt_prompt
+                elif attempt_number > 1:
+                    attempt_prompt += (
+                        "\n\nAgentFlow supervised durable-goal resume:\n"
+                        + execution_node.durable_goal.resume_instruction
+                    )
+            prepared = adapter.prepare(execution_node, attempt_prompt, paths)
             # Forward local credentials to remote targets when enabled
             # EC2/ECS: always forward (ephemeral, no pre-existing config)
             # SSH: only if forward_credentials=True (remote has its own identity)
@@ -1141,7 +1245,26 @@ class Orchestrator:
             if not result.final_response and parser.supports_raw_stdout_fallback():
                 result.final_response = "\n".join(attempt_stdout_lines).strip()
             result.output = result.final_response if execution_node.capture.value == "final" else "\n".join(attempt_stdout_lines)
+            result.structured_output = None
+            structured_output, structured_error = parse_json_output(result.output or result.final_response)
+            if structured_error is None:
+                result.structured_output = structured_output
             success_ok, success_details = evaluate_success(execution_node, result, paths.host_workdir)
+            if execution_node.output_schema is not None:
+                contract_errors = (
+                    [f"node {node.id!r} output: {structured_error}"]
+                    if structured_error is not None
+                    else validate_json_contract(
+                        structured_output,
+                        execution_node.output_schema,
+                        label=f"node {node.id!r} output",
+                    )
+                )
+                if contract_errors:
+                    success_ok = False
+                    success_details = [*success_details, *contract_errors]
+                else:
+                    success_details = [*success_details, "output_schema=True"]
             result.success = success_ok
             result.success_details = success_details
             attempt.finished_at = utcnow_iso()
@@ -1151,7 +1274,7 @@ class Orchestrator:
             attempt.success = success_ok
             attempt.success_details = success_details
 
-            if raw.cancelled or self._should_cancel(run_id):
+            if (raw.cancelled or self._should_cancel(run_id)) and not raw.timed_out:
                 attempt.status = NodeStatus.CANCELLED
                 result.status = NodeStatus.CANCELLED
                 result.finished_at = attempt.finished_at
@@ -1200,12 +1323,15 @@ class Orchestrator:
                     )
                 break
 
-            attempt.status = NodeStatus.FAILED
-            result.status = NodeStatus.FAILED
+            terminal_failure_status = (
+                NodeStatus.TIMED_OUT if raw.timed_out else NodeStatus.FAILED
+            )
+            attempt.status = terminal_failure_status
+            result.status = terminal_failure_status
             result.finished_at = attempt.finished_at
             await self._publish(
                 run_id,
-                "node_failed",
+                "node_timed_out" if raw.timed_out else "node_failed",
                 node_id=node_id,
                 attempt=attempt_number,
                 exit_code=result.exit_code,
@@ -1214,6 +1340,18 @@ class Orchestrator:
                 final_response=result.final_response,
                 success_details=result.success_details,
             )
+            if execution_node.durable_goal is not None:
+                await self.store.write_artifact_json(
+                    run_id,
+                    node_id,
+                    f"durable-goal-checkpoint-attempt-{attempt_number}.json",
+                    {
+                        "attempt": attempt_number,
+                        "status": result.status.value,
+                        "connectorScopes": list(execution_node.connectors),
+                        "resumeMode": execution_node.durable_goal.mode,
+                    },
+                )
             if attempt_number <= node.retries:
                 if getattr(node, "retry_backoff_strategy", "exponential") == "exponential":
                     delay = min(
@@ -1227,6 +1365,16 @@ class Orchestrator:
             break
 
         await self.store.write_artifact_text(run_id, node_id, "output.txt", result.output or "")
+        if (
+            execution_node.output_artifact is not None
+            and result.status in {NodeStatus.COMPLETED, NodeStatus.READY}
+        ):
+            await self.store.write_artifact_text(
+                run_id,
+                node_id,
+                execution_node.output_artifact,
+                result.output or "",
+            )
         await self.store.write_artifact_json(run_id, node_id, "result.json", result.model_dump(mode="json"))
 
         # Merge scratchboard writes from node output
@@ -1272,6 +1420,115 @@ class Orchestrator:
             )
         return _NodeExecutionOutcome(node_id=node_id)
 
+    async def _expand_runtime_fanout(
+        self,
+        run_id: str,
+        template: NodeSpec,
+        *,
+        node_map: dict[str, NodeSpec],
+        remaining: set[str],
+    ) -> None:
+        record = self.store.get_run(run_id)
+        fanout = template.fanout_from
+        if fanout is None:  # pragma: no cover - guarded by the scheduler
+            raise ValueError(f"node {template.id!r} has no runtime fan-out specification")
+        source = record.nodes[fanout.from_]
+        if fanout.connector is not None and fanout.resource is not None:
+            structured = await self._connector_manager.fetch_collection(
+                run_id,
+                record.pipeline,
+                fanout.connector,
+                fanout.resource,
+            )
+        else:
+            structured = source.structured_output
+            if structured is None:
+                structured, parse_error = parse_json_output(source.output or source.final_response)
+                if parse_error is not None:
+                    raise ValueError(
+                        f"runtime fan-out {template.id!r} could not parse source "
+                        f"{fanout.from_!r}: {parse_error}"
+                    )
+                source.structured_output = structured
+        try:
+            values = select_json_path(structured, fanout.path)
+        except KeyError as exc:
+            raise ValueError(
+                f"runtime fan-out {template.id!r} path {fanout.path!r} "
+                f"was not found in source {fanout.from_!r}"
+            ) from exc
+        if not isinstance(values, list):
+            raise ValueError(
+                f"runtime fan-out {template.id!r} expected a collection at "
+                f"{fanout.path!r}, got {type(values).__name__}"
+            )
+        if fanout.connector is not None and any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            raise ValueError(
+                f"connector-backed runtime fan-out {template.id!r} must return only stable string IDs"
+            )
+
+        members, member_ids = expand_runtime_fanout_node(template, values)
+        collisions = sorted(set(member_ids) & set(node_map))
+        if collisions:
+            raise ValueError(
+                f"runtime fan-out {template.id!r} produced node ids that already exist: {collisions}"
+            )
+        record.pipeline.fanouts[template.id] = member_ids
+        template_result = record.nodes[template.id]
+        template_result.status = NodeStatus.RUNNING
+        template_result.started_at = template_result.started_at or utcnow_iso()
+        template_result.structured_output = values
+        await self._publish(
+            run_id,
+            "runtime_fanout_expanded",
+            node_id=template.id,
+            source_node_id=fanout.from_,
+            connector=fanout.connector,
+            resource=fanout.resource,
+            members=member_ids,
+        )
+        for index, member in enumerate(members):
+            if fanout.connector is not None:
+                self._connector_manager.bind_member(run_id, member, values[index])
+            record.pipeline.nodes.append(member)
+            node_map[member.id] = member
+            record.nodes[member.id] = NodeResult(node_id=member.id, status=NodeStatus.PENDING)
+            remaining.add(member.id)
+        await self.store.persist_run(run_id)
+
+    async def _settle_runtime_fanout(self, run_id: str, template: NodeSpec) -> bool:
+        record = self.store.get_run(run_id)
+        if template.id not in record.pipeline.fanouts:
+            return False
+        member_ids = record.pipeline.fanouts[template.id]
+        if any(record.nodes[member_id].status not in _TERMINAL_NODE_STATUSES for member_id in member_ids):
+            return False
+        result = record.nodes[template.id]
+        if result.status == NodeStatus.COMPLETED:
+            return True
+        result.status = NodeStatus.COMPLETED
+        result.success = True
+        result.finished_at = utcnow_iso()
+        result.output = json.dumps(
+            {
+                "members": member_ids,
+                "statuses": {member_id: record.nodes[member_id].status.value for member_id in member_ids},
+            },
+            ensure_ascii=False,
+        )
+        await self._publish(
+            run_id,
+            "runtime_fanout_settled",
+            node_id=template.id,
+            members=member_ids,
+        )
+        await self.store.write_artifact_text(run_id, template.id, "output.txt", result.output)
+        await self.store.write_artifact_json(run_id, template.id, "result.json", result.model_dump(mode="json"))
+        await self.store.persist_run(run_id)
+        return True
+
     async def run(self, run_id: str) -> RunRecord:
         """Drive a run until all nodes reach terminal outcomes.
 
@@ -1290,11 +1547,18 @@ class Orchestrator:
         record.started_at = utcnow_iso()
         await self._publish(run_id, "run_started", pipeline=pipeline.model_dump(mode="json"))
         await self.store.persist_run(run_id)
+        await self._persist_source_snapshot(run_id, record)
         if not self._should_cancel(run_id):
             try:
                 await self._prepare_inference_service(run_id, record)
             except Exception as exc:  # noqa: BLE001 - fail the run before scheduling nodes.
                 return await self._fail_inference_setup(run_id, exc)
+            pipeline = record.pipeline
+        if not self._should_cancel(run_id):
+            try:
+                await self._prepare_connectors(run_id, record)
+            except Exception as exc:  # noqa: BLE001 - fail before scheduling nodes.
+                return await self._fail_connector_setup(run_id, exc)
             pipeline = record.pipeline
 
         node_map = pipeline.node_map
@@ -1321,26 +1585,45 @@ class Orchestrator:
             for node_id, node in node_map.items()
             if node.schedule is not None
         }
+        runtime_templates = {
+            node_id: node
+            for node_id, node in node_map.items()
+            if node.fanout_from is not None
+        }
+        runtime_expanded = {
+            node_id for node_id in runtime_templates if node_id in pipeline.fanouts
+        }
+        pool_semaphores = {
+            name: asyncio.Semaphore(limit)
+            for name, limit in pipeline.concurrency_pools.items()
+        }
 
         async def launch(node_id: str) -> _NodeExecutionOutcome:
             async with semaphore:
                 node = node_map[node_id]
-                if node.schedule is None:
-                    return await self._execute_node(run_id, node_id)
-                state = periodic_state[node_id]
-                state.tick_count += 1
-                tick_started_at = utcnow_iso()
-                state.last_tick_started_at = tick_started_at
-                state.last_tick_started_mono = loop.time()
-                record.nodes[node_id].tick_count = state.tick_count
-                record.nodes[node_id].last_tick_started_at = tick_started_at
-                record.nodes[node_id].next_scheduled_at = None
-                return await self._execute_node(
-                    run_id,
-                    node_id,
-                    periodic_tick_number=state.tick_count,
-                    periodic_tick_started_at=tick_started_at,
-                )
+                pool = pool_semaphores.get(node.concurrency_pool or "")
+                if pool is not None:
+                    await pool.acquire()
+                try:
+                    if node.schedule is None:
+                        return await self._execute_node(run_id, node_id)
+                    state = periodic_state[node_id]
+                    state.tick_count += 1
+                    tick_started_at = utcnow_iso()
+                    state.last_tick_started_at = tick_started_at
+                    state.last_tick_started_mono = loop.time()
+                    record.nodes[node_id].tick_count = state.tick_count
+                    record.nodes[node_id].last_tick_started_at = tick_started_at
+                    record.nodes[node_id].next_scheduled_at = None
+                    return await self._execute_node(
+                        run_id,
+                        node_id,
+                        periodic_tick_number=state.tick_count,
+                        periodic_tick_started_at=tick_started_at,
+                    )
+                finally:
+                    if pool is not None:
+                        pool.release()
 
         while remaining or in_progress:
             if self._should_cancel(run_id):
@@ -1350,7 +1633,43 @@ class Orchestrator:
                 if not in_progress:
                     break
 
-            failed_nodes = {node_id for node_id, node in record.nodes.items() if node.status == NodeStatus.FAILED}
+            for template_id, template in runtime_templates.items():
+                if template_id in runtime_expanded:
+                    await self._settle_runtime_fanout(run_id, template)
+                    continue
+                if template_id not in remaining:
+                    continue
+                if not all(record.nodes[dependency].status == NodeStatus.COMPLETED for dependency in template.depends_on):
+                    continue
+                remaining.remove(template_id)
+                try:
+                    await self._expand_runtime_fanout(
+                        run_id,
+                        template,
+                        node_map=node_map,
+                        remaining=remaining,
+                    )
+                    runtime_expanded.add(template_id)
+                    await self._settle_runtime_fanout(run_id, template)
+                except Exception as exc:  # noqa: BLE001 - surface expansion failures as node failures.
+                    result = record.nodes[template_id]
+                    result.status = NodeStatus.FAILED
+                    result.success = False
+                    result.finished_at = utcnow_iso()
+                    result.success_details = [str(exc)]
+                    await self._publish(
+                        run_id,
+                        "node_failed",
+                        node_id=template_id,
+                        error=str(exc),
+                    )
+                    await self.store.persist_run(run_id)
+
+            failed_nodes = {
+                node_id
+                for node_id, node in record.nodes.items()
+                if node.status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT}
+            }
             if pipeline.fail_fast and failed_nodes:
                 for node_id in list(remaining):
                     record.nodes[node_id].status = NodeStatus.SKIPPED
@@ -1397,7 +1716,7 @@ class Orchestrator:
                 for node_id in list(remaining)
                 if node_id not in cycle_nodes  # don't skip any node in a cycle
                 and node_id not in cycle_downstream  # don't skip nodes waiting on cycle outcome
-                and any(record.nodes[dependency].status in {NodeStatus.FAILED, NodeStatus.SKIPPED, NodeStatus.CANCELLED} for dependency in node_map[node_id].depends_on)
+                and any(record.nodes[dependency].status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT, NodeStatus.SKIPPED, NodeStatus.CANCELLED} for dependency in node_map[node_id].depends_on)
             ]
             for node_id in blocked:
                 record.nodes[node_id].status = NodeStatus.SKIPPED
@@ -1427,7 +1746,7 @@ class Orchestrator:
                 node = node_map[node_id]
                 # Cycle nodes can proceed when deps are COMPLETED or FAILED
                 if node_id in cycle_nodes or node.on_failure_restart:
-                    terminal = {NodeStatus.COMPLETED, NodeStatus.FAILED}
+                    terminal = {NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.TIMED_OUT}
                     if not all(record.nodes[dep].status in terminal for dep in node.depends_on):
                         continue
                 elif not all(record.nodes[dep].status == NodeStatus.COMPLETED for dep in node.depends_on):
@@ -1436,6 +1755,21 @@ class Orchestrator:
                     ready.append(node_id)
                     continue
                 state = periodic_state[node_id]
+                if state.waiting_for_actuation:
+                    continue
+                watched_members = pipeline.fanouts.get(
+                    node.schedule.until_fanout_settles_from,
+                    [],
+                )
+                if watched_members and all(
+                    record.nodes[member_id].status
+                    in {NodeStatus.PENDING, NodeStatus.READY, NodeStatus.QUEUED}
+                    for member_id in watched_members
+                ):
+                    # A controller cannot observe useful state before any watched
+                    # member has started. Let workers launch first so tick 1 has a
+                    # stable view of their logs and lifecycle state.
+                    continue
                 if state.next_tick_at is None or now >= state.next_tick_at:
                     ready.append(node_id)
             for node_id in ready:
@@ -1448,9 +1782,31 @@ class Orchestrator:
                 finished_ids = [node_id for node_id, task in in_progress.items() if task in done]
                 for node_id in finished_ids:
                     task = in_progress.pop(node_id)
-                    outcome = await task
                     node = node_map[node_id]
                     self._node_cancel_flags.setdefault(run_id, set()).discard(node_id)
+                    try:
+                        outcome = await task
+                    except Exception as exc:  # noqa: BLE001 - keep scheduling and connector cleanup alive.
+                        node_result = record.nodes[node_id]
+                        node_result.status = NodeStatus.FAILED
+                        node_result.success = False
+                        node_result.finished_at = utcnow_iso()
+                        node_result.success_details = [f"node execution crashed: {exc}"]
+                        if node_result.attempts and node_result.attempts[-1].status == NodeStatus.RUNNING:
+                            node_result.attempts[-1].status = NodeStatus.FAILED
+                            node_result.attempts[-1].finished_at = node_result.finished_at
+                            node_result.attempts[-1].success = False
+                            node_result.attempts[-1].success_details = list(node_result.success_details)
+                        await self._publish(
+                            run_id,
+                            "node_failed",
+                            node_id=node_id,
+                            error=str(exc),
+                            success=False,
+                            success_details=node_result.success_details,
+                        )
+                        await self.store.persist_run(run_id)
+                        continue
 
                     if node.schedule is not None:
                         if outcome.periodic_actions is not None:
@@ -1484,6 +1840,11 @@ class Orchestrator:
                                 remaining=remaining,
                                 in_progress=in_progress,
                             )
+                            if any(
+                                action.kind in {"cancel", "rerun"} and action.node_ids
+                                for action in outcome.periodic_actions.actions
+                            ):
+                                periodic_state[node_id].waiting_for_actuation = True
 
                         node_result = record.nodes[node_id]
                         if node_result.status == NodeStatus.READY and not self._should_cancel(run_id):
@@ -1514,7 +1875,7 @@ class Orchestrator:
 
                     # -- on_failure_restart: cycle back-edge handling --
                     if (
-                        record.nodes[node_id].status == NodeStatus.FAILED
+                        record.nodes[node_id].status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT}
                         and node.on_failure_restart
                         and not self._should_cancel(run_id)
                     ):
@@ -1567,6 +1928,8 @@ class Orchestrator:
                         remaining.add(node_id)
                         await self._publish(run_id, "node_rerun_queued", node_id=node_id)
                         await self.store.persist_run(run_id)
+                for template_id in runtime_expanded:
+                    await self._settle_runtime_fanout(run_id, runtime_templates[template_id])
             elif remaining:
                 await asyncio.sleep(0.05)
             else:
@@ -1574,10 +1937,20 @@ class Orchestrator:
 
         if record.status == RunStatus.CANCELLING or self._should_cancel(run_id):
             record.status = RunStatus.CANCELLED
-        elif any(node.status == NodeStatus.FAILED for node in record.nodes.values()):
+        elif any(
+            node.status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT}
+            for node in record.nodes.values()
+        ):
             record.status = RunStatus.FAILED
         else:
             record.status = RunStatus.COMPLETED
+        if pipeline.connectors:
+            await self._connector_manager.stop(run_id)
+            await self._publish(
+                run_id,
+                "connectors_stopped",
+                connectors=[connector.name for connector in pipeline.connectors],
+            )
         record.finished_at = utcnow_iso()
         await self._publish(run_id, "run_completed", status=record.status.value)
         await self.store.clear_cancel_request(run_id)

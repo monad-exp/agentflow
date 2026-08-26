@@ -299,6 +299,8 @@ class LocalRunner(Runner):
         launch_env.update(target_env)
         env = os.environ.copy()
         env.update(launch_env)
+        for env_name in node.connector_secret_env:
+            env.pop(env_name, None)
         command = self._inline_env_wrapper_assignments(command, launch_env)
         process = await asyncio.create_subprocess_exec(
             *command,

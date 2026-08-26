@@ -52,10 +52,18 @@ class ClaudeAdapter(AgentAdapter):
             command.extend(["--bare", "--add-dir", paths.target_workdir])
         if node.model:
             command.extend(["--model", node.model])
-        allowed_tools = _CLAUDE_READ_ONLY_TOOLS if node.tools == ToolAccess.READ_ONLY else _CLAUDE_READ_WRITE_TOOLS
+        allowed_tools = list(
+            _CLAUDE_READ_ONLY_TOOLS if node.tools == ToolAccess.READ_ONLY else _CLAUDE_READ_WRITE_TOOLS
+        )
+        allowed_tools.extend(
+            f"mcp__{binding.name}__{tool.name}"
+            for binding in node.connector_bindings
+            for tool in binding.tools
+        )
         command.extend(["--tools", ",".join(allowed_tools)])
         runtime_files: dict[str, str] = {}
         if node.mcps:
+            connector_bindings = {binding.name: binding for binding in node.connector_bindings}
             mcp_payload: dict[str, object] = {"mcpServers": {}}
             for mcp in node.mcps:
                 inner: dict[str, object] = {}
@@ -69,8 +77,13 @@ class ClaudeAdapter(AgentAdapter):
                 else:
                     if mcp.url:
                         inner["url"] = mcp.url
-                    if mcp.headers:
-                        inner["headers"] = mcp.headers
+                    headers = (
+                        connector_bindings[mcp.name].headers
+                        if mcp.name in connector_bindings
+                        else mcp.headers
+                    )
+                    if headers:
+                        inner["headers"] = headers
                     inner["transport"] = "streamable_http"
                 mcp_payload["mcpServers"][mcp.name] = inner
             relative_path = self.relative_runtime_file("claude-mcp.json")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -7,11 +8,54 @@ from agentflow.specs import (
     FileContainsCriterion,
     FileExistsCriterion,
     FileNonEmptyCriterion,
+    ConnectorToolCalledCriterion,
     NodeResult,
     NodeSpec,
     OutputContainsCriterion,
     OutputRegexCriterion,
 )
+
+
+def _connector_tool_completed(result: NodeResult, connector: str, tool: str) -> bool:
+    aliases = {
+        tool,
+        f"{connector}.{tool}",
+        f"{connector}_{tool}",
+        f"mcp__{connector}__{tool}",
+    }
+    for event in result.trace_events:
+        raw = event.raw
+        text = " ".join(
+            part
+            for part in (
+                event.title,
+                event.content or "",
+                json.dumps(raw, ensure_ascii=False, sort_keys=True) if raw is not None else "",
+            )
+            if part
+        )
+        if not any(alias in text for alias in aliases) or connector not in text:
+            continue
+        if isinstance(raw, dict):
+            item = raw.get("item")
+            if isinstance(item, dict) and item.get("type") == "mcp_tool_call":
+                if item.get("server") != connector or item.get("tool") != tool:
+                    continue
+                if event.kind != "item_completed":
+                    continue
+                error = item.get("error")
+                return (
+                    item.get("status") == "completed"
+                    and (error is None or error == "")
+                )
+        lowered = text.lower()
+        if event.kind in {"tool_result", "toolresult"} and "error" not in lowered:
+            return True
+        if event.kind in {"assistant_message", "message_end", "agent_end", "turn_end", "event"} and any(
+            marker in lowered for marker in ("tool_use", "tooluse", "tool_call", "toolcall")
+        ):
+            return True
+    return False
 
 
 def _read_success_text(path: Path) -> str | None:
@@ -75,6 +119,11 @@ def evaluate_success(node: NodeSpec, result: NodeResult, working_dir: Path) -> t
             path = working_dir / criterion.path
             ok = path.exists() and _has_nonempty_contents(path)
             messages.append(f"file_nonempty({criterion.path})={ok}")
+        elif isinstance(criterion, ConnectorToolCalledCriterion):
+            ok = _connector_tool_completed(result, criterion.connector, criterion.tool)
+            messages.append(
+                f"connector_tool_called({criterion.connector}.{criterion.tool})={ok}"
+            )
         else:
             ok = False
             messages.append(f"unsupported success criterion: {criterion}")

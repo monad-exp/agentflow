@@ -17,3 +17,4 @@
 | `airflow_like.py` | You want the smallest Python-authored DAG reference. | Static dependencies with `plan >> [implement, review]`. |
 | `airflow_like_fuzz_batched.py` | You want a large shard campaign driven by count fanout, batch merge, and a periodic monitor. | `fanout(node, 128)`, `merge(node, src, size=16)`, `schedule.every_seconds`. |
 | `airflow_like_fuzz_grouped.py` | You want a large shard campaign driven by matrix fanout and grouped merge. | `fanout(node, {...})`, `merge(node, src, by=[...])`. |
+| `bugfinder/pipeline.py` | You want the issue-1 single-commit bug-finding MVP. | Source snapshots, run-scoped PostgreSQL connector, durable runtime fan-out, all-terminal fan-in, named provider pools, supervised goals, and per-Finding reports. |

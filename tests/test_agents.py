@@ -144,6 +144,43 @@ def test_codex_adapter_uses_runtime_codex_home_for_mcp_config(tmp_path):
     assert 'command = "npx"' in prepared.runtime_files["codex_home/config.toml"]
 
 
+def test_codex_adapter_approves_only_declared_connector_tools(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "persist",
+            "agent": "codex",
+            "prompt": "persist",
+            "mcps": [
+                {
+                    "name": "bugdb",
+                    "transport": "streamable_http",
+                    "url": "http://127.0.0.1:4312/mcp",
+                }
+            ],
+            "connector_bindings": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:4312/mcp",
+                    "tools": [
+                        {
+                            "name": "add_hunts",
+                            "description": "Append Hunts",
+                            "input_schema": {"type": "object"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    prepared = CodexAdapter().prepare(node, node.prompt, _paths(tmp_path))
+    config = prepared.runtime_files["codex_home/config.toml"]
+
+    assert "[mcp_servers.bugdb.tools.add_hunts]" in config
+    assert 'approval_mode = "approve"' in config
+    assert "dangerously" not in " ".join(prepared.command)
+
+
 def test_codex_adapter_isolates_home_when_runtime_codex_home_is_used(tmp_path):
     node = NodeSpec.model_validate(
         {
@@ -222,6 +259,42 @@ def test_claude_adapter_uses_tools_flag_for_read_write_access(tmp_path):
     index = prepared.command.index("--tools")
     assert "Bash" in prepared.command[index + 1].split(",")
     assert "Write" in prepared.command[index + 1].split(",")
+
+
+def test_claude_adapter_allows_declared_connector_tools(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "persist",
+            "agent": "claude",
+            "prompt": "Persist",
+            "mcps": [
+                {
+                    "name": "bugdb",
+                    "transport": "streamable_http",
+                    "url": "http://127.0.0.1:4312/mcp",
+                }
+            ],
+            "connector_bindings": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:4312/mcp",
+                    "tools": [
+                        {
+                            "name": "add_hunts",
+                            "description": "Append Hunts",
+                            "input_schema": {"type": "object"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    prepared = ClaudeAdapter().prepare(node, "Persist", _paths(tmp_path))
+    tools_index = prepared.command.index("--tools")
+
+    assert "mcp__bugdb__add_hunts" in prepared.command[tools_index + 1].split(",")
+    assert "--mcp-config" in prepared.command
 
 
 def test_claude_adapter_can_ignore_repo_instructions_with_bare_runtime_cwd(tmp_path):
@@ -596,6 +669,44 @@ def test_pi_adapter_rejects_mcp_servers(tmp_path):
     )
     with pytest.raises(ValueError, match="pi adapter does not support `mcps`"):
         PiAdapter().prepare(node, "Scan", _paths(tmp_path))
+
+
+def test_pi_adapter_bridges_run_scoped_connector_tools_with_an_extension(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "scan",
+            "agent": "pi",
+            "prompt": "Scan",
+            "mcps": [{"name": "bugdb", "transport": "streamable_http", "url": "http://127.0.0.1:4312/mcp"}],
+            "connector_bindings": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:4312/mcp",
+                    "tools": [
+                        {
+                            "name": "add_lead",
+                            "description": "Append one immutable Lead",
+                            "input_schema": {
+                                "type": "object",
+                                "required": ["callerKey"],
+                                "properties": {"callerKey": {"type": "string"}},
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    prepared = PiAdapter().prepare(node, "Scan", _paths(tmp_path))
+
+    assert "--extension" in prepared.command
+    assert "bugdb_add_lead" in prepared.command[prepared.command.index("--tools") + 1]
+    extension_path = str(Path("connectors") / "agentflow-connector-bridge.ts")
+    extension = prepared.runtime_files[extension_path]
+    assert "pi.registerTool" in extension
+    assert "bugdb_add_lead" in extension
+    assert "http://127.0.0.1:4312/mcp" in extension
 
 
 def test_pi_adapter_forwards_api_key_env(tmp_path, monkeypatch):
