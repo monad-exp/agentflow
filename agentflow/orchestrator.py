@@ -1600,9 +1600,15 @@ class Orchestrator:
             terminal_failure_status = (
                 NodeStatus.TIMED_OUT if raw.timed_out else NodeStatus.FAILED
             )
+            will_retry = retry_index < node.retries
             attempt.status = terminal_failure_status
-            result.status = terminal_failure_status
-            result.finished_at = attempt.finished_at
+            # Keep the aggregate node non-terminal while another attempt is
+            # pending. The scheduler runs concurrently with retry backoff and
+            # uses this status to settle fan-outs and block downstream nodes.
+            # The attempt itself remains terminal so its failure evidence is
+            # preserved without exposing a false final node outcome.
+            result.status = NodeStatus.RETRYING if will_retry else terminal_failure_status
+            result.finished_at = None if will_retry else attempt.finished_at
             await self._publish(
                 run_id,
                 "node_timed_out" if raw.timed_out else "node_failed",
@@ -1614,7 +1620,7 @@ class Orchestrator:
                 final_response=result.final_response,
                 success_details=result.success_details,
             )
-            if retry_index < node.retries:
+            if will_retry:
                 if getattr(node, "retry_backoff_strategy", "exponential") == "exponential":
                     delay = min(
                         node.retry_backoff_seconds * (2 ** retry_index),
