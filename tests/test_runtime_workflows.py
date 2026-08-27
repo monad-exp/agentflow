@@ -1175,7 +1175,11 @@ async def test_supervised_durable_goal_retries_from_connector_state(tmp_path: Pa
 
     assert completed.status.value == "completed"
     assert len(completed.nodes["hunt"].attempts) == 2
-    assert "AgentFlow supervised durable-goal resume" in (completed.nodes["hunt"].output or "")
+    output = completed.nodes["hunt"].output or ""
+    assert "AgentFlow supervised durable-goal resume" in output
+    assert "Do not repeat completed work" in output
+    assert "persist useful progress incrementally" in output
+    assert "before reaching the response limit" in output
     checkpoint = orchestrator.store.artifact_path(
         completed.id, "hunt", "durable-goal-checkpoint-attempt-1.json"
     )
