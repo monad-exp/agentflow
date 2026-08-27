@@ -62,6 +62,19 @@ def test_stream_supports_tty_summary_treats_click_testing_streams_as_terminal():
     assert json.loads(result.stdout) == {"stdout": True, "stderr": True}
 
 
+@pytest.mark.parametrize("module", ["click.testing", "typer.testing"])
+def test_click_testing_stream_detection_supports_click_and_typer_wrappers(module: str):
+    wrapper_type = type("_NamedTextIOWrapper", (), {"__module__": module})
+
+    assert agentflow.cli._is_click_testing_stream(wrapper_type()) is True
+
+
+def test_click_testing_stream_detection_rejects_unrelated_named_wrapper():
+    wrapper_type = type("_NamedTextIOWrapper", (), {"__module__": "unrelated.testing"})
+
+    assert agentflow.cli._is_click_testing_stream(wrapper_type()) is False
+
+
 def _doctor_report(status: str = "ok", detail: str = "ready") -> DoctorReport:
     check_status = "failed" if status == "failed" else "ok"
     return DoctorReport(
