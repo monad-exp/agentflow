@@ -34,6 +34,10 @@ from agentflow.local_shell import (
     target_uses_interactive_bash,
     target_uses_login_bash,
 )
+from agentflow.output_capture import (
+    RETAINED_TRACE_EVENT_MAX_COUNT,
+    TRACE_EVENT_COMPACTION_TRIGGER_COUNT,
+)
 
 
 class AgentKind(StrEnum):
@@ -2774,6 +2778,50 @@ class NodeResult(BaseModel):
     last_tick_started_at: str | None = None
     next_scheduled_at: str | None = None
     diff: str | None = None
+
+    @field_validator("trace_events")
+    @classmethod
+    def _bound_loaded_trace_events(
+        cls,
+        events: list[NormalizedTraceEvent],
+    ) -> list[NormalizedTraceEvent]:
+        return cls._compact_trace_events(events)
+
+    @staticmethod
+    def _compact_trace_events(
+        events: list[NormalizedTraceEvent],
+    ) -> list[NormalizedTraceEvent]:
+        if len(events) <= RETAINED_TRACE_EVENT_MAX_COUNT:
+            return events
+
+        # Connector completion events are success-criterion evidence. Preserve
+        # them preferentially, then fill the remaining budget with the newest
+        # diagnostic events in original chronological order.
+        connector_indexes = [
+            index
+            for index, event in enumerate(events)
+            if event.kind == "connector_tool_completed"
+        ]
+        if len(connector_indexes) >= RETAINED_TRACE_EVENT_MAX_COUNT:
+            selected_indexes = connector_indexes[-RETAINED_TRACE_EVENT_MAX_COUNT:]
+        else:
+            connector_index_set = set(connector_indexes)
+            remaining = RETAINED_TRACE_EVENT_MAX_COUNT - len(connector_indexes)
+            recent_indexes = [
+                index
+                for index in range(len(events) - 1, -1, -1)
+                if index not in connector_index_set
+            ][:remaining]
+            selected_indexes = sorted([*connector_indexes, *recent_indexes])
+        return [events[index] for index in selected_indexes]
+
+    def append_trace_event(self, event: NormalizedTraceEvent) -> None:
+        self.trace_events.append(event)
+        if len(self.trace_events) >= TRACE_EVENT_COMPACTION_TRIGGER_COUNT:
+            self.trace_events = self._compact_trace_events(self.trace_events)
+
+    def compact_trace_events(self) -> None:
+        self.trace_events = self._compact_trace_events(self.trace_events)
 
 
 class RunRecord(BaseModel):

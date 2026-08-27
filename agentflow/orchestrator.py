@@ -40,6 +40,13 @@ from agentflow.graph_optimizer import (
     write_validation_result,
 )
 from agentflow.loader import load_pipeline_from_path
+from agentflow.output_capture import (
+    BoundedLineBuffer,
+    OUTPUT_TRUNCATION_MARKER,
+    STREAM_ARTIFACT_MAX_BYTES,
+    TRACE_ARTIFACT_MAX_BYTES,
+    TRACE_ARTIFACT_TRUNCATION_MARKER,
+)
 from agentflow.prepared import ExecutionPaths, PreparedExecution, build_execution_paths
 from agentflow.runners.registry import RunnerRegistry, default_runner_registry
 from agentflow.specs import (
@@ -72,6 +79,14 @@ _TERMINAL_NODE_STATUSES = {
     NodeStatus.TIMED_OUT,
     NodeStatus.SKIPPED,
     NodeStatus.CANCELLED,
+}
+
+_TRANSIENT_TRACE_KINDS = {
+    "assistant_delta",
+    "reasoning_delta",
+    "command_output",
+    "stdout",
+    "stderr",
 }
 
 
@@ -1094,8 +1109,24 @@ class Orchestrator:
         await self.store.append_event(run_id, RunEvent(run_id=run_id, type=event_type, node_id=node_id, data=data))
 
     async def _publish_trace(self, run_id: str, node_id: str, event) -> None:
-        await self.store.append_artifact_text(run_id, node_id, "trace.jsonl", event.model_dump_json() + "\n")
-        await self._publish(run_id, "node_trace", node_id=node_id, trace=event.model_dump(mode="json"))
+        await self.store.append_artifact_text_bounded(
+            run_id,
+            node_id,
+            "trace.jsonl",
+            event.model_dump_json() + "\n",
+            max_bytes=TRACE_ARTIFACT_MAX_BYTES,
+            truncation_marker=TRACE_ARTIFACT_TRUNCATION_MARKER,
+        )
+        run_event = RunEvent(
+            run_id=run_id,
+            type="node_trace",
+            node_id=node_id,
+            data={"trace": event.model_dump(mode="json")},
+        )
+        if event.kind in _TRANSIENT_TRACE_KINDS:
+            await self.store.publish_transient_event(run_id, run_event)
+        else:
+            await self.store.append_event(run_id, run_event)
 
     def _is_sensitive_launch_key(self, key: str) -> bool:
         return looks_sensitive_key(key)
@@ -1390,8 +1421,8 @@ class Orchestrator:
                 return _NodeExecutionOutcome(node_id=node_id, periodic_tick_number=periodic_tick_number)
 
             attempt = NodeAttempt(number=attempt_number, status=NodeStatus.RUNNING, started_at=utcnow_iso())
-            attempt_stdout_lines: list[str] = []
-            attempt_stderr_lines: list[str] = []
+            attempt_stdout_lines = BoundedLineBuffer()
+            attempt_stderr_lines = BoundedLineBuffer()
             result.current_attempt = attempt_number
             result.attempts.append(attempt)
             parser.start_attempt(attempt_number)
@@ -1428,17 +1459,21 @@ class Orchestrator:
                 prepared.runtime_files[SCRATCHBOARD_FILENAME] = scratchboard.read()
             plan = runner.plan_execution(execution_node, prepared, paths)
             await self._write_launch_artifacts(run_id, node_id, attempt_number, plan)
-            await self.store.append_artifact_text(
+            await self.store.append_artifact_text_bounded(
                 run_id,
                 node_id,
                 "stdout.log",
                 f"\n=== attempt {attempt_number} started {attempt.started_at} ===\n",
+                max_bytes=STREAM_ARTIFACT_MAX_BYTES,
+                truncation_marker=OUTPUT_TRUNCATION_MARKER,
             )
-            await self.store.append_artifact_text(
+            await self.store.append_artifact_text_bounded(
                 run_id,
                 node_id,
                 "stderr.log",
                 f"\n=== attempt {attempt_number} started {attempt.started_at} ===\n",
+                max_bytes=STREAM_ARTIFACT_MAX_BYTES,
+                truncation_marker=OUTPUT_TRUNCATION_MARKER,
             )
             if attempt_number > 1:
                 result.status = NodeStatus.RETRYING
@@ -1453,18 +1488,32 @@ class Orchestrator:
 
             async def on_output(stream_name: str, line: str) -> None:
                 if stream_name == "stdout":
-                    await self.store.append_artifact_text(run_id, node_id, "stdout.log", line + "\n")
+                    await self.store.append_artifact_text_bounded(
+                        run_id,
+                        node_id,
+                        "stdout.log",
+                        line + "\n",
+                        max_bytes=STREAM_ARTIFACT_MAX_BYTES,
+                        truncation_marker=OUTPUT_TRUNCATION_MARKER,
+                    )
                     parsed_events = parser.feed(line)
-                    if parsed_events or parser.supports_raw_stdout_fallback():
+                    if parser.supports_raw_stdout_fallback():
                         attempt_stdout_lines.append(line)
                     for event in parsed_events:
-                        result.trace_events.append(event)
+                        result.append_trace_event(event)
                         await self._publish_trace(run_id, node_id, event)
                 else:
                     attempt_stderr_lines.append(line)
-                    await self.store.append_artifact_text(run_id, node_id, "stderr.log", line + "\n")
+                    await self.store.append_artifact_text_bounded(
+                        run_id,
+                        node_id,
+                        "stderr.log",
+                        line + "\n",
+                        max_bytes=STREAM_ARTIFACT_MAX_BYTES,
+                        truncation_marker=OUTPUT_TRUNCATION_MARKER,
+                    )
                     event = parser.emit("stderr", "stderr", line, line, source="stderr")
-                    result.trace_events.append(event)
+                    result.append_trace_event(event)
                     await self._publish_trace(run_id, node_id, event)
 
             raw = await runner.execute(
@@ -1475,12 +1524,16 @@ class Orchestrator:
                 lambda: self._should_cancel(run_id) or self._should_cancel_node(run_id, node_id),
             )
             result.exit_code = raw.exit_code
-            result.stdout_lines = attempt_stdout_lines
-            result.stderr_lines = attempt_stderr_lines
+            result.stdout_lines = attempt_stdout_lines.as_list()
+            result.stderr_lines = attempt_stderr_lines.as_list()
             result.final_response = parser.finalize()
             if not result.final_response and parser.supports_raw_stdout_fallback():
-                result.final_response = "\n".join(attempt_stdout_lines).strip()
-            result.output = result.final_response if execution_node.capture.value == "final" else "\n".join(attempt_stdout_lines)
+                result.final_response = "\n".join(attempt_stdout_lines.as_list()).strip()
+            result.output = (
+                result.final_response
+                if execution_node.capture.value == "final" or not parser.supports_raw_stdout_fallback()
+                else "\n".join(attempt_stdout_lines.as_list())
+            )
             result.structured_output = None
             structured_output, structured_error = parse_json_output(result.output or result.final_response)
             if structured_error is None:
@@ -1581,6 +1634,7 @@ class Orchestrator:
                 continue
             break
 
+        result.compact_trace_events()
         await self.store.write_artifact_text(run_id, node_id, "output.txt", result.output or "")
         if (
             execution_node.output_artifact is not None
