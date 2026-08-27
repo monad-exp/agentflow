@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from agentflow.output_capture import BoundedLineBuffer
 from agentflow.specs import AgentKind, NormalizedTraceEvent
 
 
@@ -43,7 +44,7 @@ class BaseTraceParser:
     node_id: str
     agent: AgentKind
     attempt: int = 1
-    final_chunks: list[str] = field(default_factory=list)
+    final_chunks: BoundedLineBuffer = field(default_factory=BoundedLineBuffer)
     last_message: str | None = None
 
     def emit(self, kind: str, title: str, content: str | None = None, raw: Any | None = None, source: str = "stdout") -> NormalizedTraceEvent:
@@ -90,13 +91,15 @@ class BaseTraceParser:
     def remember(self, text: str | None) -> None:
         if text:
             self.final_chunks.append(text)
-            self.last_message = text
+            self.last_message = self.final_chunks.latest()
 
     def feed(self, line: str) -> list[NormalizedTraceEvent]:
         raise NotImplementedError
 
     def finalize(self) -> str:
-        joined = "\n".join(chunk.strip() for chunk in self.final_chunks if chunk and chunk.strip()).strip()
+        joined = "\n".join(
+            chunk.strip() for chunk in self.final_chunks.as_list() if chunk and chunk.strip()
+        ).strip()
         return joined or (self.last_message or "")
 
     def supports_raw_stdout_fallback(self) -> bool:
@@ -406,14 +409,22 @@ class PiTraceParser(BaseTraceParser):
         if event_type == "message_update":
             inner = payload.get("assistantMessageEvent") or {}
             sub_type = inner.get("type")
+            compact_raw = {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    key: inner[key]
+                    for key in ("type", "contentIndex", "delta", "content")
+                    if key in inner
+                },
+            }
             if sub_type == "text_delta":
                 delta = inner.get("delta")
                 if isinstance(delta, str):
-                    events.append(self.emit("assistant_delta", "Assistant delta", delta, payload))
+                    events.append(self.emit("assistant_delta", "Assistant delta", delta, compact_raw))
             elif sub_type == "text_end":
                 content = inner.get("content")
                 if isinstance(content, str):
-                    events.append(self.emit("assistant_text", "Assistant text", content, payload))
+                    events.append(self.emit("assistant_text", "Assistant text", content, compact_raw))
             return events
 
         if event_type == "turn_end":

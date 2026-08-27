@@ -8,6 +8,7 @@ import textwrap
 
 import pytest
 
+from agentflow.output_capture import OUTPUT_TRUNCATION_MARKER, RETAINED_STREAM_MAX_BYTES
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.container import ContainerRunner
 from agentflow.runners.local import LocalRunner
@@ -23,6 +24,36 @@ def _paths(tmp_path: Path) -> ExecutionPaths:
         target_runtime_dir=str(runtime_dir),
         app_root=tmp_path,
     )
+
+
+@pytest.mark.asyncio
+async def test_local_runner_bounds_retained_stream_output_while_forwarding_all_lines(tmp_path: Path):
+    line_count = 2048
+    forwarded = 0
+
+    async def count_output(_stream_name: str, _text: str) -> None:
+        nonlocal forwarded
+        forwarded += 1
+
+    node = NodeSpec.model_validate({"id": "chatty", "agent": "codex", "prompt": "hi"})
+    prepared = PreparedExecution(
+        command=[
+            "python3",
+            "-c",
+            "for i in range(2048): print(f'{i:04d}:' + 'x' * 1024, flush=True)",
+        ],
+        env={},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+
+    result = await LocalRunner().execute(node, prepared, _paths(tmp_path), count_output, lambda: False)
+
+    assert result.exit_code == 0
+    assert forwarded == line_count
+    assert result.stdout_lines[0] == OUTPUT_TRUNCATION_MARKER
+    assert result.stdout_lines[-1].startswith("2047:")
+    assert sum(len(line.encode("utf-8")) for line in result.stdout_lines[1:]) <= RETAINED_STREAM_MAX_BYTES
 
 
 @pytest.mark.asyncio

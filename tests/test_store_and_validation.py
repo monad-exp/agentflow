@@ -5,8 +5,38 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
+from agentflow.output_capture import OUTPUT_TRUNCATION_MARKER
 from agentflow.specs import LocalTarget, PipelineSpec, RunEvent, RunRecord
 from agentflow.store import RunStore
+
+
+@pytest.mark.asyncio
+async def test_bounded_artifact_append_preserves_existing_data_and_writes_one_marker(tmp_path):
+    store = RunStore(tmp_path / "runs")
+    await store.append_artifact_text("run", "node", "stdout.log", "existing-data\n")
+
+    first = await store.append_artifact_text_bounded(
+        "run",
+        "node",
+        "stdout.log",
+        "new data\n",
+        max_bytes=8,
+        truncation_marker=OUTPUT_TRUNCATION_MARKER,
+    )
+    second = await store.append_artifact_text_bounded(
+        "run",
+        "node",
+        "stdout.log",
+        "more data\n",
+        max_bytes=8,
+        truncation_marker=OUTPUT_TRUNCATION_MARKER,
+    )
+
+    content = store.read_artifact_text("run", "node", "stdout.log")
+    assert first is False
+    assert second is False
+    assert content.startswith("existing-data\n")
+    assert content.count(OUTPUT_TRUNCATION_MARKER) == 1
 
 
 def test_pipeline_validation_applies_node_defaults_and_agent_defaults():

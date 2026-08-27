@@ -8,6 +8,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from agentflow.local_shell import render_shell_init, shell_wrapper_requires_command_placeholder, target_uses_interactive_bash
+from agentflow.output_capture import BoundedLineBuffer
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.base import LaunchPlan, RawExecutionResult, Runner, StreamCallback
 from agentflow.specs import LocalTarget, NodeSpec
@@ -266,7 +267,14 @@ class LocalRunner(Runner):
             transport.close()
             await asyncio.sleep(0)
 
-    async def _consume_stream(self, node: NodeSpec, stream, stream_name: str, buffer: list[str], on_output: StreamCallback) -> None:
+    async def _consume_stream(
+        self,
+        node: NodeSpec,
+        stream,
+        stream_name: str,
+        buffer: BoundedLineBuffer,
+        on_output: StreamCallback,
+    ) -> None:
         while True:
             line = await stream.readline()
             if not line:
@@ -327,8 +335,8 @@ class LocalRunner(Runner):
         elif process.stdin is not None:
             process.stdin.close()
 
-        stdout_lines: list[str] = []
-        stderr_lines: list[str] = []
+        stdout_lines = BoundedLineBuffer()
+        stderr_lines = BoundedLineBuffer()
         stdout_task = asyncio.create_task(self._consume_stream(node, process.stdout, "stdout", stdout_lines, on_output))
         stderr_task = asyncio.create_task(self._consume_stream(node, process.stderr, "stderr", stderr_lines, on_output))
         wait_task = asyncio.create_task(process.wait())
@@ -412,13 +420,15 @@ class LocalRunner(Runner):
         if timed_out:
             await self._terminate_with_fallback(process, wait_task)
             await _drain_streams()
-            stderr_lines.append(f"Timed out after {node.timeout_seconds}s")
-            await on_output("stderr", stderr_lines[-1])
+            message = f"Timed out after {node.timeout_seconds}s"
+            stderr_lines.append(message)
+            await on_output("stderr", message)
         elif cancelled:
             await self._terminate_with_fallback(process, wait_task)
             await _drain_streams()
-            stderr_lines.append("Cancelled by user")
-            await on_output("stderr", stderr_lines[-1])
+            message = "Cancelled by user"
+            stderr_lines.append(message)
+            await on_output("stderr", message)
         elif external_exit_code is not None:
             if not await self._wait_for_exit(
                 wait_task, self._EXTERNAL_COMPLETION_GRACE_SECONDS
@@ -449,8 +459,8 @@ class LocalRunner(Runner):
             exit_code = process.returncode if process.returncode is not None else 0
         return RawExecutionResult(
             exit_code=exit_code,
-            stdout_lines=stdout_lines,
-            stderr_lines=stderr_lines,
+            stdout_lines=stdout_lines.as_list(),
+            stderr_lines=stderr_lines.as_list(),
             timed_out=timed_out,
             cancelled=cancelled,
         )

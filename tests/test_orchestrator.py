@@ -13,6 +13,7 @@ from agentflow.agents.base import AgentAdapter
 from agentflow.agents.registry import AdapterRegistry
 from agentflow.inference import SkyInferenceService
 from agentflow.orchestrator import Orchestrator
+from agentflow.output_capture import OUTPUT_TRUNCATION_MARKER
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.registry import RunnerRegistry
 from agentflow.specs import AgentKind, PipelineSpec
@@ -1272,6 +1273,84 @@ raise SystemExit(1)
     assert node.success is False
     assert node.success_details == ["output_contains('kimi ok')=False"]
     assert node.attempts[0].output == ""
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_bounds_cumulative_pi_stream_without_losing_final_output(
+    tmp_path: Path,
+    monkeypatch,
+):
+    class CumulativePiAdapter(AgentAdapter):
+        def prepare(self, node, prompt: str, paths: ExecutionPaths) -> PreparedExecution:
+            script = r'''
+import json
+
+for index in range(40):
+    partial = "x" * ((index + 1) * 200)
+    print(json.dumps({
+        "type": "message_update",
+        "assistantMessageEvent": {
+            "type": "text_delta",
+            "contentIndex": 0,
+            "delta": "x",
+            "partial": {"content": partial},
+        },
+        "message": {"content": partial},
+    }), flush=True)
+print(json.dumps({
+    "type": "message_end",
+    "message": {"role": "assistant", "content": [{"type": "text", "text": "pi done"}]},
+}), flush=True)
+print(json.dumps({
+    "type": "agent_end",
+    "messages": [{"role": "assistant", "content": [{"type": "text", "text": "pi done"}]}],
+}), flush=True)
+'''
+            return PreparedExecution(
+                command=["python3", "-c", script],
+                env={},
+                cwd=paths.target_workdir,
+                trace_kind=node.agent.value,
+            )
+
+    monkeypatch.setattr("agentflow.orchestrator.STREAM_ARTIFACT_MAX_BYTES", 2048)
+    adapters = AdapterRegistry()
+    adapters.register(AgentKind.PI, CumulativePiAdapter())
+    orchestrator = Orchestrator(
+        store=RunStore(tmp_path / "runs"),
+        adapters=adapters,
+        runners=RunnerRegistry(),
+    )
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "bounded-pi-output",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {
+                    "id": "scan",
+                    "agent": "pi",
+                    "prompt": "finish",
+                    "capture": "trace",
+                    "success_criteria": [{"kind": "output_contains", "value": "pi done"}],
+                }
+            ],
+        }
+    )
+
+    run = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(run.id, timeout=5)
+    node = completed.nodes["scan"]
+    stdout_log = orchestrator.store.read_artifact_text(completed.id, "scan", "stdout.log")
+    delta_events = [event for event in node.trace_events if event.kind == "assistant_delta"]
+
+    assert completed.status.value == "completed"
+    assert node.final_response == "pi done"
+    assert node.output == "pi done"
+    assert node.stdout_lines == []
+    assert stdout_log.count(OUTPUT_TRUNCATION_MARKER) == 1
+    assert len(stdout_log.encode("utf-8")) < 2048 + len(OUTPUT_TRUNCATION_MARKER) + 200
+    assert len(delta_events) == 40
+    assert all("partial" not in event.raw["assistantMessageEvent"] for event in delta_events)
 
 
 @pytest.mark.asyncio

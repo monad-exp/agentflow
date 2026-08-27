@@ -1,3 +1,5 @@
+import json
+
 from agentflow.specs import AgentKind
 from agentflow.traces import create_trace_parser
 
@@ -103,6 +105,31 @@ def test_pi_trace_parser_emits_delta_events():
     assert len(events) == 1
     assert events[0].kind == "assistant_delta"
     assert events[0].content == "partial"
+
+
+def test_pi_trace_parser_omits_cumulative_partial_from_delta_raw_payload():
+    parser = create_trace_parser(AgentKind.PI, "scan")
+    line = json.dumps(
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "contentIndex": 0,
+                "delta": "x",
+                "partial": {"content": "x" * 100_000},
+            },
+            "message": {"content": "x" * 100_000},
+        }
+    )
+
+    event = parser.feed(line)[0]
+
+    assert event.content == "x"
+    assert event.raw == {
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "x"},
+    }
+    assert len(json.dumps(event.raw)) < 200
 
 
 def test_pi_trace_parser_prefers_agent_end_when_present():

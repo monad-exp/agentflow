@@ -106,6 +106,48 @@ class RunStore:
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(content)
 
+    async def append_artifact_text_bounded(
+        self,
+        run_id: str,
+        node_id: str,
+        name: str,
+        content: str,
+        *,
+        max_bytes: int,
+        truncation_marker: str,
+    ) -> bool:
+        """Append whole text records until a byte limit, then one marker.
+
+        Existing artifacts are never shortened. The marker may exceed
+        ``max_bytes`` so a previously oversized artifact still records why new
+        output is no longer being appended.
+        """
+
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        path = self.artifact_path(run_id, node_id, name)
+        ensure_dir(path.parent)
+        content_bytes = content.encode("utf-8")
+        marker = truncation_marker.rstrip("\n") + "\n"
+        marker_bytes = marker.encode("utf-8")
+        lock = self._locks[run_id]
+        with lock:
+            current_size = path.stat().st_size if path.exists() else 0
+            if current_size + len(content_bytes) <= max_bytes:
+                with path.open("ab") as handle:
+                    handle.write(content_bytes)
+                return True
+
+            marker_present = False
+            if path.exists() and current_size:
+                with path.open("rb") as handle:
+                    handle.seek(max(0, current_size - len(marker_bytes)))
+                    marker_present = handle.read().endswith(marker_bytes)
+            if not marker_present:
+                with path.open("ab") as handle:
+                    handle.write(marker_bytes)
+            return False
+
     async def write_artifact_text(self, run_id: str, node_id: str, name: str, content: str) -> None:
         path = self.artifact_path(run_id, node_id, name)
         ensure_dir(path.parent)
