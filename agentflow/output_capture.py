@@ -13,6 +13,13 @@ RETAINED_STREAM_MAX_BYTES = 1024 * 1024
 # that repeat their assembled response alongside every token delta.
 STREAM_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
 
+# Normalized traces remain useful after raw stdout has been capped, but token
+# deltas must not grow run state and diagnostic artifacts without limit.
+TRACE_ARTIFACT_MAX_BYTES = 64 * 1024 * 1024
+RETAINED_TRACE_EVENT_MAX_COUNT = 4096
+TRACE_EVENT_COMPACTION_TRIGGER_COUNT = 5120
+RETAINED_RUN_TRACE_EVENTS_MAX_COUNT = 4096
+
 # asyncio's subprocess StreamReader must keep draining even when a tool emits a
 # single enormous JSONL record.  Records above this limit are discarded and
 # replaced with a compact diagnostic marker instead of wedging process.wait().
@@ -20,6 +27,7 @@ STREAM_RECORD_MAX_BYTES = 8 * 1024 * 1024
 
 OUTPUT_TRUNCATION_MARKER = "[AgentFlow output truncated: older or excess stream data was omitted]"
 OVERSIZED_STREAM_RECORD_MARKER = "[AgentFlow stream record omitted: exceeded safe capture limit]"
+TRACE_ARTIFACT_TRUNCATION_MARKER = "[AgentFlow trace artifact capped: additional trace events were omitted]"
 
 
 @dataclass(slots=True)

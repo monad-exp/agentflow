@@ -6,7 +6,15 @@ import pytest
 from pydantic import ValidationError
 
 from agentflow.output_capture import OUTPUT_TRUNCATION_MARKER
-from agentflow.specs import LocalTarget, PipelineSpec, RunEvent, RunRecord
+from agentflow.specs import (
+    AgentKind,
+    LocalTarget,
+    NodeResult,
+    NormalizedTraceEvent,
+    PipelineSpec,
+    RunEvent,
+    RunRecord,
+)
 from agentflow.store import RunStore
 
 
@@ -37,6 +45,80 @@ async def test_bounded_artifact_append_preserves_existing_data_and_writes_one_ma
     assert second is False
     assert content.startswith("existing-data\n")
     assert content.count(OUTPUT_TRUNCATION_MARKER) == 1
+
+
+def test_node_result_bounds_trace_events_while_preserving_connector_evidence(monkeypatch):
+    monkeypatch.setattr("agentflow.specs.RETAINED_TRACE_EVENT_MAX_COUNT", 4)
+    connector = NormalizedTraceEvent(
+        node_id="scan",
+        agent=AgentKind.PI,
+        kind="connector_tool_completed",
+        title="connector",
+        connector="bugdb",
+        tool="finish_hunt",
+        is_error=False,
+    )
+    deltas = [
+        NormalizedTraceEvent(
+            node_id="scan",
+            agent=AgentKind.PI,
+            kind="reasoning_delta",
+            title="delta",
+            content=str(index),
+        )
+        for index in range(10)
+    ]
+
+    result = NodeResult(node_id="scan", trace_events=[connector, *deltas])
+
+    assert len(result.trace_events) == 4
+    assert result.trace_events[0].kind == "connector_tool_completed"
+    assert [event.content for event in result.trace_events[1:]] == ["7", "8", "9"]
+
+
+@pytest.mark.asyncio
+async def test_store_loads_bounded_trace_history_and_preserves_lifecycle_events(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentflow.store.RETAINED_RUN_TRACE_EVENTS_MAX_COUNT", 2)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "events",
+            "working_dir": str(tmp_path),
+            "nodes": [{"id": "scan", "agent": "pi", "prompt": "scan"}],
+        }
+    )
+    original = RunStore(tmp_path / "runs")
+    await original.create_run(RunRecord(id="run-1", pipeline=pipeline))
+    await original.append_event("run-1", RunEvent(run_id="run-1", type="run_started"))
+    for index in range(5):
+        await original.append_event(
+            "run-1",
+            RunEvent(run_id="run-1", type="node_trace", data={"index": index}),
+        )
+    await original.append_event("run-1", RunEvent(run_id="run-1", type="run_completed"))
+
+    reloaded = RunStore(tmp_path / "runs")
+    events = reloaded.get_events("run-1")
+
+    assert [event.type for event in events] == [
+        "run_started",
+        "node_trace",
+        "node_trace",
+        "run_completed",
+    ]
+    assert [event.data["index"] for event in events if event.type == "node_trace"] == [3, 4]
+
+
+@pytest.mark.asyncio
+async def test_store_transient_event_reaches_subscribers_without_persistence(tmp_path):
+    store = RunStore(tmp_path / "runs")
+    queue = await store.subscribe("run-1")
+    event = RunEvent(run_id="run-1", type="node_trace", data={"trace": "delta"})
+
+    await store.publish_transient_event("run-1", event)
+
+    assert queue.get_nowait() == event
+    assert store.get_events("run-1") == []
+    assert not (store.run_dir("run-1") / "events.jsonl").exists()
 
 
 def test_pipeline_validation_applies_node_defaults_and_agent_defaults():

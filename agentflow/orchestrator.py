@@ -43,6 +43,8 @@ from agentflow.output_capture import (
     BoundedLineBuffer,
     OUTPUT_TRUNCATION_MARKER,
     STREAM_ARTIFACT_MAX_BYTES,
+    TRACE_ARTIFACT_MAX_BYTES,
+    TRACE_ARTIFACT_TRUNCATION_MARKER,
 )
 from agentflow.prepared import ExecutionPaths, PreparedExecution, build_execution_paths
 from agentflow.runners.registry import RunnerRegistry, default_runner_registry
@@ -76,6 +78,14 @@ _TERMINAL_NODE_STATUSES = {
     NodeStatus.TIMED_OUT,
     NodeStatus.SKIPPED,
     NodeStatus.CANCELLED,
+}
+
+_TRANSIENT_TRACE_KINDS = {
+    "assistant_delta",
+    "reasoning_delta",
+    "command_output",
+    "stdout",
+    "stderr",
 }
 
 
@@ -935,8 +945,24 @@ class Orchestrator:
         await self.store.append_event(run_id, RunEvent(run_id=run_id, type=event_type, node_id=node_id, data=data))
 
     async def _publish_trace(self, run_id: str, node_id: str, event) -> None:
-        await self.store.append_artifact_text(run_id, node_id, "trace.jsonl", event.model_dump_json() + "\n")
-        await self._publish(run_id, "node_trace", node_id=node_id, trace=event.model_dump(mode="json"))
+        await self.store.append_artifact_text_bounded(
+            run_id,
+            node_id,
+            "trace.jsonl",
+            event.model_dump_json() + "\n",
+            max_bytes=TRACE_ARTIFACT_MAX_BYTES,
+            truncation_marker=TRACE_ARTIFACT_TRUNCATION_MARKER,
+        )
+        run_event = RunEvent(
+            run_id=run_id,
+            type="node_trace",
+            node_id=node_id,
+            data={"trace": event.model_dump(mode="json")},
+        )
+        if event.kind in _TRANSIENT_TRACE_KINDS:
+            await self.store.publish_transient_event(run_id, run_event)
+        else:
+            await self.store.append_event(run_id, run_event)
 
     def _is_sensitive_launch_key(self, key: str) -> bool:
         return looks_sensitive_key(key)
@@ -1308,7 +1334,7 @@ class Orchestrator:
                     if parser.supports_raw_stdout_fallback():
                         attempt_stdout_lines.append(line)
                     for event in parsed_events:
-                        result.trace_events.append(event)
+                        result.append_trace_event(event)
                         await self._publish_trace(run_id, node_id, event)
                 else:
                     attempt_stderr_lines.append(line)
@@ -1321,7 +1347,7 @@ class Orchestrator:
                         truncation_marker=OUTPUT_TRUNCATION_MARKER,
                     )
                     event = parser.emit("stderr", "stderr", line, line, source="stderr")
-                    result.trace_events.append(event)
+                    result.append_trace_event(event)
                     await self._publish_trace(run_id, node_id, event)
 
             raw = await runner.execute(
@@ -1442,6 +1468,7 @@ class Orchestrator:
                 continue
             break
 
+        result.compact_trace_events()
         await self.store.write_artifact_text(run_id, node_id, "output.txt", result.output or "")
         if (
             execution_node.output_artifact is not None

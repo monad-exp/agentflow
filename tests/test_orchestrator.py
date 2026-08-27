@@ -13,7 +13,7 @@ from agentflow.agents.base import AgentAdapter
 from agentflow.agents.registry import AdapterRegistry
 from agentflow.inference import SkyInferenceService
 from agentflow.orchestrator import Orchestrator
-from agentflow.output_capture import OUTPUT_TRUNCATION_MARKER
+from agentflow.output_capture import OUTPUT_TRUNCATION_MARKER, TRACE_ARTIFACT_TRUNCATION_MARKER
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.registry import RunnerRegistry
 from agentflow.specs import AgentKind, PipelineSpec
@@ -1314,6 +1314,7 @@ print(json.dumps({
             )
 
     monkeypatch.setattr("agentflow.orchestrator.STREAM_ARTIFACT_MAX_BYTES", 2048)
+    monkeypatch.setattr("agentflow.orchestrator.TRACE_ARTIFACT_MAX_BYTES", 2048)
     adapters = AdapterRegistry()
     adapters.register(AgentKind.PI, CumulativePiAdapter())
     orchestrator = Orchestrator(
@@ -1341,7 +1342,13 @@ print(json.dumps({
     completed = await orchestrator.wait(run.id, timeout=5)
     node = completed.nodes["scan"]
     stdout_log = orchestrator.store.read_artifact_text(completed.id, "scan", "stdout.log")
+    trace_log = orchestrator.store.read_artifact_text(completed.id, "scan", "trace.jsonl")
     delta_events = [event for event in node.trace_events if event.kind == "reasoning_delta"]
+    cached_trace_kinds = [
+        event.data["trace"]["kind"]
+        for event in orchestrator.store.get_events(completed.id)
+        if event.type == "node_trace"
+    ]
 
     assert completed.status.value == "completed"
     assert node.final_response == "pi done"
@@ -1349,8 +1356,11 @@ print(json.dumps({
     assert node.stdout_lines == []
     assert stdout_log.count(OUTPUT_TRUNCATION_MARKER) == 1
     assert len(stdout_log.encode("utf-8")) < 2048 + len(OUTPUT_TRUNCATION_MARKER) + 200
+    assert trace_log.count(TRACE_ARTIFACT_TRUNCATION_MARKER) == 1
     assert len(delta_events) == 40
     assert all("partial" not in event.raw["assistantMessageEvent"] for event in delta_events)
+    assert "reasoning_delta" not in cached_trace_kinds
+    assert "agent_end" in cached_trace_kinds
 
 
 @pytest.mark.asyncio
