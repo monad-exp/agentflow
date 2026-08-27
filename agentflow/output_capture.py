@@ -13,7 +13,13 @@ RETAINED_STREAM_MAX_BYTES = 1024 * 1024
 # that repeat their assembled response alongside every token delta.
 STREAM_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
 
+# asyncio's subprocess StreamReader must keep draining even when a tool emits a
+# single enormous JSONL record.  Records above this limit are discarded and
+# replaced with a compact diagnostic marker instead of wedging process.wait().
+STREAM_RECORD_MAX_BYTES = 8 * 1024 * 1024
+
 OUTPUT_TRUNCATION_MARKER = "[AgentFlow output truncated: older or excess stream data was omitted]"
+OVERSIZED_STREAM_RECORD_MARKER = "[AgentFlow stream record omitted: exceeded safe capture limit]"
 
 
 @dataclass(slots=True)

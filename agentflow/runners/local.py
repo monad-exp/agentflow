@@ -8,7 +8,11 @@ from contextlib import suppress
 from pathlib import Path
 
 from agentflow.local_shell import render_shell_init, shell_wrapper_requires_command_placeholder, target_uses_interactive_bash
-from agentflow.output_capture import BoundedLineBuffer
+from agentflow.output_capture import (
+    BoundedLineBuffer,
+    OVERSIZED_STREAM_RECORD_MARKER,
+    STREAM_RECORD_MAX_BYTES,
+)
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.base import LaunchPlan, RawExecutionResult, Runner, StreamCallback
 from agentflow.specs import LocalTarget, NodeSpec
@@ -16,6 +20,7 @@ from agentflow.utils import ensure_dir
 
 
 class LocalRunner(Runner):
+    _STREAM_RECORD_MAX_BYTES = STREAM_RECORD_MAX_BYTES
     _KNOWN_SHELL_EXECUTABLES = {
         "ash",
         "bash",
@@ -276,14 +281,45 @@ class LocalRunner(Runner):
         on_output: StreamCallback,
     ) -> None:
         while True:
-            line = await stream.readline()
-            if not line:
+            line, oversized = await self._read_stream_record(stream)
+            if line is None:
                 break
-            text = line.decode("utf-8", errors="replace").rstrip("\n")
+            text = (
+                OVERSIZED_STREAM_RECORD_MARKER
+                if oversized
+                else line.decode("utf-8", errors="replace").rstrip("\n")
+            )
             if stream_name == "stderr" and self._should_suppress_stderr(node, text):
                 continue
             buffer.append(text)
             await on_output(stream_name, text)
+
+    async def _read_stream_record(self, stream) -> tuple[bytes | None, bool]:
+        """Read one delimited record while bounding StreamReader memory.
+
+        StreamReader.readline() raises ValueError when a record exceeds its
+        configured limit.  If that exception escapes the consumer task, the
+        subprocess transport can pause forever with buffered output and keep
+        process.wait() from completing even after the child exits.  Drain an
+        oversized record in bounded pieces and report a compact marker.
+        """
+
+        oversized = False
+        while True:
+            try:
+                line = await stream.readuntil(b"\n")
+            except asyncio.LimitOverrunError as exc:
+                oversized = True
+                try:
+                    await stream.readexactly(max(exc.consumed, 1))
+                except asyncio.IncompleteReadError:
+                    return b"", True
+            except asyncio.IncompleteReadError as exc:
+                if oversized:
+                    return b"", True
+                return (exc.partial, False) if exc.partial else (None, False)
+            else:
+                return (b"", True) if oversized else (line, False)
 
     def _external_completion(
         self,
@@ -327,6 +363,7 @@ class LocalRunner(Runner):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE if prepared.stdin is not None else asyncio.subprocess.DEVNULL,
+            limit=self._STREAM_RECORD_MAX_BYTES,
         )
         if prepared.stdin is not None and process.stdin is not None:
             process.stdin.write(prepared.stdin.encode("utf-8"))

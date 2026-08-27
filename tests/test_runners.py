@@ -8,7 +8,11 @@ import textwrap
 
 import pytest
 
-from agentflow.output_capture import OUTPUT_TRUNCATION_MARKER, RETAINED_STREAM_MAX_BYTES
+from agentflow.output_capture import (
+    OUTPUT_TRUNCATION_MARKER,
+    OVERSIZED_STREAM_RECORD_MARKER,
+    RETAINED_STREAM_MAX_BYTES,
+)
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.container import ContainerRunner
 from agentflow.runners.local import LocalRunner
@@ -54,6 +58,37 @@ async def test_local_runner_bounds_retained_stream_output_while_forwarding_all_l
     assert result.stdout_lines[0] == OUTPUT_TRUNCATION_MARKER
     assert result.stdout_lines[-1].startswith("2047:")
     assert sum(len(line.encode("utf-8")) for line in result.stdout_lines[1:]) <= RETAINED_STREAM_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_local_runner_drains_oversized_record_and_observes_process_exit(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(LocalRunner, "_STREAM_RECORD_MAX_BYTES", 1024)
+    forwarded: list[tuple[str, str]] = []
+
+    async def capture_output(stream_name: str, text: str) -> None:
+        forwarded.append((stream_name, text))
+
+    node = NodeSpec.model_validate({"id": "oversized-record", "agent": "codex", "prompt": "hi"})
+    prepared = PreparedExecution(
+        command=[
+            "python3",
+            "-c",
+            'import sys; sys.stdout.write("x" * 8192 + "\\nok\\n"); sys.stdout.flush(); raise SystemExit(17)',
+        ],
+        env={},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+
+    result = await asyncio.wait_for(
+        LocalRunner().execute(node, prepared, _paths(tmp_path), capture_output, lambda: False),
+        timeout=5,
+    )
+
+    assert result.exit_code == 17
+    assert result.timed_out is False
+    assert result.stdout_lines == [OVERSIZED_STREAM_RECORD_MARKER, "ok"]
+    assert forwarded == [("stdout", OVERSIZED_STREAM_RECORD_MARKER), ("stdout", "ok")]
 
 
 @pytest.mark.asyncio
