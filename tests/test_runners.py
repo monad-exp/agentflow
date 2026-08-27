@@ -672,6 +672,96 @@ async def test_local_runner_timeout_uses_standard_exit_code(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_local_runner_does_not_busy_spin_after_one_stream_reaches_eof(
+    tmp_path: Path,
+    monkeypatch,
+):
+    real_wait = asyncio.wait
+    wait_calls = 0
+
+    async def counting_wait(*args, **kwargs):
+        nonlocal wait_calls
+        wait_calls += 1
+        return await real_wait(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait", counting_wait)
+    node = NodeSpec.model_validate(
+        {
+            "id": "one-stream-eof",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 5,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[
+            "python3",
+            "-c",
+            "import os, time; os.close(2); time.sleep(0.1)",
+        ],
+        env={},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+
+    result = await LocalRunner().execute(
+        node,
+        prepared,
+        _paths(tmp_path),
+        _noop_output,
+        lambda: False,
+    )
+
+    assert result.exit_code == 0
+    assert result.timed_out is False
+    assert wait_calls < 20
+
+
+@pytest.mark.asyncio
+async def test_local_runner_waits_for_process_after_both_streams_reach_eof(
+    tmp_path: Path,
+    monkeypatch,
+):
+    real_wait = asyncio.wait
+
+    async def shorten_legacy_stream_eof_grace(*args, **kwargs):
+        if kwargs.get("timeout") == 5:
+            kwargs["timeout"] = 0.01
+        return await real_wait(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait", shorten_legacy_stream_eof_grace)
+    node = NodeSpec.model_validate(
+        {
+            "id": "both-streams-eof",
+            "agent": "codex",
+            "prompt": "hi",
+            "timeout_seconds": 5,
+        }
+    )
+    prepared = PreparedExecution(
+        command=[
+            "python3",
+            "-c",
+            "import os, time; os.close(1); os.close(2); time.sleep(0.1)",
+        ],
+        env={},
+        cwd=str(tmp_path),
+        trace_kind="codex",
+    )
+
+    result = await LocalRunner().execute(
+        node,
+        prepared,
+        _paths(tmp_path),
+        _noop_output,
+        lambda: False,
+    )
+
+    assert result.exit_code == 0
+    assert result.timed_out is False
+
+
+@pytest.mark.asyncio
 async def test_local_runner_termination_closes_subprocess_transport():
     class FakeTransport:
         def __init__(self) -> None:
