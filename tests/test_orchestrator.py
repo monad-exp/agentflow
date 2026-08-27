@@ -1013,6 +1013,53 @@ async def test_orchestrator_persists_active_attempt_before_runner_launch(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_retry_backoff_does_not_skip_downstream_node(tmp_path: Path):
+    orchestrator = make_orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "retry-dependency",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {
+                    "id": "flaky",
+                    "agent": "codex",
+                    "prompt": "recovered",
+                    "retries": 1,
+                    "retry_backoff_seconds": 0.5,
+                },
+                {
+                    "id": "downstream",
+                    "agent": "codex",
+                    "prompt": "ran after retry",
+                    "depends_on": ["flaky"],
+                },
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    deadline = asyncio.get_running_loop().time() + 2
+    while asyncio.get_running_loop().time() < deadline:
+        live = orchestrator.store.get_run(submitted.id)
+        attempts = live.nodes["flaky"].attempts
+        if attempts and attempts[-1].status.value == "failed":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("first retry attempt did not fail")
+
+    assert live.nodes["flaky"].status.value == "retrying"
+    assert live.nodes["flaky"].finished_at is None
+    assert live.nodes["downstream"].status.value == "pending"
+
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+    assert completed.status.value == "completed"
+    assert completed.nodes["flaky"].status.value == "completed"
+    assert completed.nodes["downstream"].status.value == "completed"
+    assert completed.nodes["downstream"].output == "ran after retry"
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_retry_isolates_final_capture_from_failed_attempt_stdout(tmp_path: Path):
     orchestrator = make_orchestrator(tmp_path)
     pipeline = PipelineSpec.model_validate(

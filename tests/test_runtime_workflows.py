@@ -55,6 +55,45 @@ print(json.dumps({
         )
 
 
+class FanoutRetryAdapter(AgentAdapter):
+    def prepare(self, node, prompt: str, paths: ExecutionPaths) -> PreparedExecution:
+        script = r'''
+import json
+import sys
+from pathlib import Path
+
+node_id = sys.argv[1]
+prompt = sys.argv[2]
+marker = Path(sys.argv[3])
+if node_id == "hunt_0":
+    if not marker.exists():
+        marker.write_text("started", encoding="utf-8")
+        raise SystemExit(1)
+    marker.write_text("completed", encoding="utf-8")
+if node_id in {"deduplicate", "report"} and (
+    not marker.exists() or marker.read_text(encoding="utf-8") != "completed"
+):
+    raise SystemExit(2)
+print(json.dumps({
+    "type": "response.output_item.done",
+    "item": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": prompt}]},
+}))
+'''
+        return PreparedExecution(
+            command=[
+                "python3",
+                "-c",
+                script,
+                node.id,
+                prompt,
+                str(Path(paths.host_workdir) / ".fanout-retry"),
+            ],
+            env={},
+            cwd=paths.target_workdir,
+            trace_kind="codex",
+        )
+
+
 def _orchestrator(tmp_path: Path) -> Orchestrator:
     adapters = AdapterRegistry()
     adapters.register(AgentKind.CODEX, MockAdapter())
@@ -115,6 +154,64 @@ async def test_runtime_fanout_expands_json_collection_and_waits_for_every_member
     assert [node.id for node in pipeline.nodes] == ["rank", "hunt", "deduplicate"]
     assert completed.declared_pipeline is not None
     assert completed.declared_pipeline.fanouts == {}
+
+
+@pytest.mark.asyncio
+async def test_runtime_fanout_does_not_settle_during_member_retry_backoff(tmp_path: Path):
+    adapters = AdapterRegistry()
+    adapters.register(AgentKind.CODEX, FanoutRetryAdapter())
+    orchestrator = Orchestrator(
+        store=RunStore(tmp_path / "runs"),
+        adapters=adapters,
+        runners=RunnerRegistry(),
+    )
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "runtime-fanout-retry",
+            "working_dir": str(tmp_path),
+            "concurrency": 3,
+            "nodes": [
+                {"id": "rank", "agent": "codex", "prompt": '[{"path":"api.py"}]'},
+                {
+                    "id": "hunt",
+                    "agent": "codex",
+                    "prompt": "hunt {{ item.path }}",
+                    "retries": 1,
+                    "retry_backoff_seconds": 0.5,
+                    "fanout_from": {"from": "rank"},
+                },
+                {
+                    "id": "deduplicate",
+                    "agent": "codex",
+                    "prompt": "deduplicated",
+                    "depends_on": ["hunt"],
+                },
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert [attempt.status for attempt in completed.nodes["hunt_0"].attempts] == [
+        NodeStatus.FAILED,
+        NodeStatus.COMPLETED,
+    ]
+    assert completed.nodes["hunt"].status == NodeStatus.COMPLETED
+    assert completed.nodes["deduplicate"].status == NodeStatus.COMPLETED
+    events = orchestrator.store.get_events(completed.id)
+    member_completed = next(
+        index
+        for index, event in enumerate(events)
+        if event.type == "node_completed" and event.node_id == "hunt_0"
+    )
+    downstream_started = next(
+        index
+        for index, event in enumerate(events)
+        if event.type == "node_started" and event.node_id == "deduplicate"
+    )
+    assert member_completed < downstream_started
 
 
 @pytest.mark.asyncio
@@ -928,7 +1025,13 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
     _git(repo, "commit", "-q", "-m", "source")
     commit_sha = _git(repo, "rev-parse", "HEAD")
 
-    orchestrator = _orchestrator(tmp_path)
+    adapters = AdapterRegistry()
+    adapters.register(AgentKind.CODEX, FanoutRetryAdapter())
+    orchestrator = Orchestrator(
+        store=RunStore(tmp_path / "runs"),
+        adapters=adapters,
+        runners=RunnerRegistry(),
+    )
     run_id = orchestrator.store.new_run_id()
     from agentflow.worktree import create_pinned_worktree
 
@@ -955,6 +1058,8 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
                     "id": "hunt",
                     "agent": "codex",
                     "prompt": "hunt",
+                    "retries": 1,
+                    "retry_backoff_seconds": 0.5,
                     "depends_on": ["rank"],
                     "connectors": ["bugdb"],
                     "fanout_from": {
@@ -1002,8 +1107,10 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
             ),
             "hunt": NodeResult(
                 node_id="hunt",
-                status=NodeStatus.RUNNING,
+                status=NodeStatus.COMPLETED,
                 structured_output=["hunt-durable"],
+                success=True,
+                finished_at="2026-01-01T00:00:01+00:00",
             ),
             "hunt_0": NodeResult(
                 node_id="hunt_0",
@@ -1032,8 +1139,10 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
     assert completed.nodes["hunt"].status == NodeStatus.COMPLETED
     assert completed.nodes["hunt_0"].status == NodeStatus.COMPLETED
     assert completed.nodes["report"].status == NodeStatus.COMPLETED
-    assert [attempt.number for attempt in completed.nodes["hunt_0"].attempts] == [1, 2]
+    assert [attempt.number for attempt in completed.nodes["hunt_0"].attempts] == [1, 2, 3]
     assert completed.nodes["hunt_0"].attempts[0].status == NodeStatus.CANCELLED
+    assert completed.nodes["hunt_0"].attempts[1].status == NodeStatus.FAILED
+    assert completed.nodes["hunt_0"].attempts[2].status == NodeStatus.COMPLETED
     assert connector_manager.started == [run_id]
     assert connector_manager.bound == [(run_id, "hunt_0", "hunt-durable")]
     assert connector_manager.stopped == [run_id]
