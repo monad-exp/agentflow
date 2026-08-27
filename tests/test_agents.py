@@ -633,6 +633,9 @@ def test_pi_adapter_materializes_scoped_models_json(tmp_path):
                 "base_url": "http://192.168.1.42:1234/v1",
                 "wire_api": "openai-completions",
                 "api_key_env": "LMSTUDIO_API_KEY",
+                "model_reasoning": True,
+                "model_context_window": 262144,
+                "model_max_tokens": 32768,
             },
             "model": "lmstudio-remote/qwen3.6-27b",
         }
@@ -655,7 +658,14 @@ def test_pi_adapter_materializes_scoped_models_json(tmp_path):
     assert entry["api"] == "openai-completions"
     assert entry["apiKey"] == "LMSTUDIO_API_KEY"
     # Provider prefix is stripped from model id in the scoped entry.
-    assert entry["models"] == [{"id": "qwen3.6-27b"}]
+    assert entry["models"] == [
+        {
+            "id": "qwen3.6-27b",
+            "reasoning": True,
+            "contextWindow": 262144,
+            "maxTokens": 32768,
+        }
+    ]
 
     settings_rel = str(Path("pi-home") / "agent" / "settings.json")
     assert settings_rel in prepared.runtime_files

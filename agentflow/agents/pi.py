@@ -161,7 +161,16 @@ class PiAdapter(AgentAdapter):
             entry["headers"] = dict(provider.headers)
             entry["authHeader"] = True
         model_id = self._extract_model_id(model, provider.name)
-        entry["models"] = [{"id": model_id}] if model_id else []
+        model_entry: dict[str, object] | None = None
+        if model_id:
+            model_entry = {"id": model_id}
+            if provider.model_reasoning is not None:
+                model_entry["reasoning"] = provider.model_reasoning
+            if provider.model_context_window is not None:
+                model_entry["contextWindow"] = provider.model_context_window
+            if provider.model_max_tokens is not None:
+                model_entry["maxTokens"] = provider.model_max_tokens
+        entry["models"] = [model_entry] if model_entry else []
 
         payload = {"providers": {provider.name: entry}}
         return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"

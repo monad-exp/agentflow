@@ -93,16 +93,42 @@ def role_agent(config: BugfinderConfig, role: str, **kwargs: Any):
     elif selected == "claude" and config.environment.get("BUGFINDER_CLAUDE_MODEL"):
         kwargs["model"] = config.environment["BUGFINDER_CLAUDE_MODEL"]
     elif selected == "pi":
-        kwargs["model"] = config.setting(
+        pi_model = config.setting(
             "BUGFINDER_PI_MODEL",
             "openrouter/anthropic/claude-sonnet-4.6",
         )
-        kwargs["provider"] = {
+        kwargs["model"] = pi_model
+        pi_provider: dict[str, Any] = {
             "name": "openrouter",
             "base_url": "https://openrouter.ai/api/v1",
             "api_key_env": "OPENROUTER_API_KEY",
             "wire_api": "openai-completions",
         }
+        pi_capabilities = {
+            "openrouter/z-ai/glm-5.3": (1048576, 65536),
+            "openrouter/moonshotai/kimi-k3": (1048576, 943718),
+        }.get(pi_model.split(":", 1)[0])
+        if pi_capabilities is not None:
+            default_context_window, default_max_tokens = pi_capabilities
+            pi_provider.update(
+                model_reasoning=True,
+                model_context_window=int(
+                    config.setting(
+                        "BUGFINDER_PI_CONTEXT_WINDOW",
+                        str(default_context_window),
+                    )
+                ),
+                model_max_tokens=int(
+                    config.setting(
+                        "BUGFINDER_PI_MAX_TOKENS",
+                        str(default_max_tokens),
+                    )
+                ),
+            )
+            extra_args = list(kwargs.get("extra_args", []))
+            extra_args.extend(["--thinking", "xhigh"])
+            kwargs["extra_args"] = extra_args
+        kwargs["provider"] = pi_provider
     return builders[selected](**kwargs)
 
 

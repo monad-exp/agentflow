@@ -81,3 +81,40 @@ def test_bugfinder_schema_and_scripts_stay_minimal():
     assert "ALTER DEFAULT PRIVILEGES" not in migration
     assert package["scripts"]["prebuild"] == "npm run prisma:generate"
     assert package["scripts"]["pretest"] == "npm run prisma:generate"
+
+
+def test_bugfinder_configures_reasoning_model_capabilities_and_xhigh_for_every_pi_role(
+    tmp_path: Path,
+):
+    for model, max_tokens in (
+        ("openrouter/z-ai/glm-5.3", 65536),
+        ("openrouter/moonshotai/kimi-k3", 943718),
+    ):
+        pipeline = build_pipeline(
+            BugfinderConfig(
+                repository=tmp_path,
+                repository_url="https://example.test/repository.git",
+                input_ref="main",
+                environment={
+                    "BUGFINDER_AGENT": "pi",
+                    "BUGFINDER_PI_MODEL": model,
+                },
+            )
+        ).to_spec()
+
+        pi_nodes = [node for node in pipeline.nodes if node.agent == AgentKind.PI]
+        assert {node.id for node in pi_nodes} == {
+            "rank_files",
+            "threat_model",
+            "roam_plan",
+            "hunt",
+            "deduplicate",
+            "triage",
+            "rereview",
+        }
+        for node in pi_nodes:
+            assert node.provider is not None
+            assert node.provider.model_reasoning is True
+            assert node.provider.model_context_window == 1048576
+            assert node.provider.model_max_tokens == max_tokens
+            assert node.extra_args[-2:] == ["--thinking", "xhigh"]
