@@ -26,16 +26,26 @@ class RunStore:
 
     def _load_event_cache(self, events_path: Path) -> list[RunEvent]:
         retained: list[tuple[int, RunEvent]] = []
-        recent_traces: deque[tuple[int, RunEvent]] = deque(
+        recent_trace_lines: deque[tuple[int, str]] = deque(
             maxlen=RETAINED_RUN_TRACE_EVENTS_MAX_COUNT
         )
         with events_path.open("r", encoding="utf-8") as handle:
             for sequence, line in enumerate(handle):
                 if not line.strip():
                     continue
-                event = RunEvent.model_validate_json(line)
-                target = recent_traces if event.type == "node_trace" else retained
-                target.append((sequence, event))
+                # RunEvent.model_dump_json() emits compact top-level fields. Do
+                # not construct hundreds of thousands of Pydantic objects that
+                # will immediately be discarded from the bounded trace tail.
+                trace_offset = line.find('"type":"node_trace"')
+                data_offset = line.find('"data":')
+                if trace_offset >= 0 and (data_offset < 0 or trace_offset < data_offset):
+                    recent_trace_lines.append((sequence, line))
+                else:
+                    retained.append((sequence, RunEvent.model_validate_json(line)))
+        recent_traces = [
+            (sequence, RunEvent.model_validate_json(line))
+            for sequence, line in recent_trace_lines
+        ]
         return [
             event
             for _, event in sorted([*retained, *recent_traces], key=lambda item: item[0])

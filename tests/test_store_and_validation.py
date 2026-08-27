@@ -96,6 +96,13 @@ async def test_store_loads_bounded_trace_history_and_preserves_lifecycle_events(
         )
     await original.append_event("run-1", RunEvent(run_id="run-1", type="run_completed"))
 
+    events_path = original.run_dir("run-1") / "events.jsonl"
+    lines = events_path.read_text(encoding="utf-8").splitlines()
+    # A discarded historical trace should not need full model construction;
+    # lifecycle events and the bounded trace tail remain strictly validated.
+    lines[1] = '{"type":"node_trace","discarded":true}'
+    events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
     reloaded = RunStore(tmp_path / "runs")
     events = reloaded.get_events("run-1")
 
