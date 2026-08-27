@@ -1033,7 +1033,7 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
         runners=RunnerRegistry(),
     )
     run_id = orchestrator.store.new_run_id()
-    from agentflow.worktree import create_pinned_worktree
+    from agentflow.worktree import create_pinned_worktree, remove_worktree
 
     source_worktree = create_pinned_worktree(repo, run_id, commit_sha)
     declared = PipelineSpec.model_validate(
@@ -1126,6 +1126,8 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
         "source-snapshot.json",
         source.model_dump(mode="json", by_alias=True),
     )
+    remove_worktree(repo, source_worktree)
+    assert not source_worktree.exists()
     connector_manager = RecoveryConnectorManager()
     orchestrator._connector_manager = connector_manager
 
@@ -1150,6 +1152,7 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
     assert "run_recovery_queued" in event_types
     assert "run_recovery_started" in event_types
     assert "node_recovery_completed" in event_types
+    assert "source_worktree_recreated" in event_types
     assert "source_snapshot_persisted" not in event_types
     assert not source_worktree.exists()
 
