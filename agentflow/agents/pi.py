@@ -34,8 +34,18 @@ class PiAdapter(AgentAdapter):
             "--print",
             "--mode",
             "json",
-            "--no-session",
         ]
+        if node.durable_goal is not None and node.durable_goal.mode == "supervised":
+            # Keep each durable node's Pi history alongside its other runtime
+            # state. --continue creates a session when none exists and resumes
+            # the most recent one on retries or process-level recovery.
+            command.extend([
+                "--session-dir",
+                str(Path(paths.target_runtime_dir) / "pi-sessions"),
+                "--continue",
+            ])
+        else:
+            command.append("--no-session")
 
         tools = _PI_READ_ONLY_TOOLS if node.tools == ToolAccess.READ_ONLY else _PI_READ_WRITE_TOOLS
         connector_tool_names = [
