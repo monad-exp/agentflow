@@ -1014,11 +1014,36 @@ class Orchestrator:
             raise ValueError(f"unknown recovery node IDs: {unknown}")
         await self._validate_recovery_source(run_id, record)
 
+        # A prior scheduler may have persisted a fan-out template as completed
+        # while one of its members was only between retry attempts. Invalidate
+        # that template and its downstream closure before deciding which
+        # completed results are safe to preserve. Completed sibling members are
+        # still durable and remain untouched.
+        invalidated = {
+            template_id
+            for template_id, member_ids in record.pipeline.fanouts.items()
+            if any(
+                record.nodes[member_id].status != NodeStatus.COMPLETED
+                and member_id not in promoted
+                for member_id in member_ids
+            )
+        }
+        while True:
+            downstream = {
+                node.id
+                for node in record.pipeline.nodes
+                if node.id not in invalidated
+                and any(dependency in invalidated for dependency in node.depends_on)
+            }
+            if not downstream:
+                break
+            invalidated.update(downstream)
+
         recovered_at = utcnow_iso()
         preserved: list[str] = []
         reset: list[str] = []
         for node_id, result in record.nodes.items():
-            if result.status == NodeStatus.COMPLETED:
+            if result.status == NodeStatus.COMPLETED and node_id not in invalidated:
                 preserved.append(node_id)
                 continue
             for attempt in result.attempts:
@@ -1600,9 +1625,15 @@ class Orchestrator:
             terminal_failure_status = (
                 NodeStatus.TIMED_OUT if raw.timed_out else NodeStatus.FAILED
             )
+            will_retry = retry_index < node.retries
             attempt.status = terminal_failure_status
-            result.status = terminal_failure_status
-            result.finished_at = attempt.finished_at
+            # Keep the aggregate node non-terminal while another attempt is
+            # pending. The scheduler runs concurrently with retry backoff and
+            # uses this status to settle fan-outs and block downstream nodes.
+            # The attempt itself remains terminal so its failure evidence is
+            # preserved without exposing a false final node outcome.
+            result.status = NodeStatus.RETRYING if will_retry else terminal_failure_status
+            result.finished_at = None if will_retry else attempt.finished_at
             await self._publish(
                 run_id,
                 "node_timed_out" if raw.timed_out else "node_failed",
@@ -1614,7 +1645,7 @@ class Orchestrator:
                 final_response=result.final_response,
                 success_details=result.success_details,
             )
-            if retry_index < node.retries:
+            if will_retry:
                 if getattr(node, "retry_backoff_strategy", "exponential") == "exponential":
                     delay = min(
                         node.retry_backoff_seconds * (2 ** retry_index),
