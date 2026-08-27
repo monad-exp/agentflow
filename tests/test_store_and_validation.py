@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 
 import pytest
 from pydantic import ValidationError
@@ -14,6 +16,7 @@ from agentflow.specs import (
     PipelineSpec,
     RunEvent,
     RunRecord,
+    RunStatus,
 )
 from agentflow.store import RunStore
 
@@ -126,6 +129,67 @@ async def test_store_transient_event_reaches_subscribers_without_persistence(tmp
     assert queue.get_nowait() == event
     assert store.get_events("run-1") == []
     assert not (store.run_dir("run-1") / "events.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_store_atomically_replaces_run_snapshot(tmp_path, monkeypatch):
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "atomic-state",
+            "working_dir": str(tmp_path),
+            "nodes": [{"id": "scan", "agent": "pi", "prompt": "scan"}],
+        }
+    )
+    store = RunStore(tmp_path / "runs")
+    record = await store.create_run(RunRecord(id="run-1", pipeline=pipeline))
+    run_path = store.run_dir(record.id) / "run.json"
+    real_replace = os.replace
+    observed: dict[str, str] = {}
+
+    def inspect_replace(source, destination):
+        observed["old"] = json.loads(run_path.read_text(encoding="utf-8"))["status"]
+        observed["new"] = json.loads(source.read_text(encoding="utf-8"))["status"]
+        assert source.parent == run_path.parent
+        assert destination == run_path
+        real_replace(source, destination)
+
+    monkeypatch.setattr("agentflow.store.os.replace", inspect_replace)
+    record.status = RunStatus.RUNNING
+
+    await store.persist_run(record.id)
+
+    assert observed == {"old": "queued", "new": "running"}
+    assert json.loads(run_path.read_text(encoding="utf-8"))["status"] == "running"
+    assert list(run_path.parent.glob(f".{run_path.name}.*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_store_preserves_previous_snapshot_when_atomic_replace_fails(tmp_path, monkeypatch):
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "atomic-state-failure",
+            "working_dir": str(tmp_path),
+            "nodes": [{"id": "scan", "agent": "pi", "prompt": "scan"}],
+        }
+    )
+    store = RunStore(tmp_path / "runs")
+    record = await store.create_run(RunRecord(id="run-1", pipeline=pipeline))
+    run_path = store.run_dir(record.id) / "run.json"
+    previous = run_path.read_text(encoding="utf-8")
+
+    def reject_replace(source, destination):
+        assert json.loads(source.read_text(encoding="utf-8"))["status"] == "running"
+        assert destination == run_path
+        raise OSError("simulated replacement failure")
+
+    monkeypatch.setattr("agentflow.store.os.replace", reject_replace)
+    record.status = RunStatus.RUNNING
+
+    with pytest.raises(OSError, match="simulated replacement failure"):
+        await store.persist_run(record.id)
+
+    assert run_path.read_text(encoding="utf-8") == previous
+    assert list(run_path.parent.glob(f".{run_path.name}.*.tmp")) == []
 
 
 def test_pipeline_validation_applies_node_defaults_and_agent_defaults():
