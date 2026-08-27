@@ -2270,6 +2270,49 @@ def resume(
 
 
 @app.command()
+def recover(
+    run_id: str,
+    completed_node: list[str] = typer.Option(
+        [],
+        "--complete-node",
+        help=(
+            "Mark a node complete only after externally verifying its durable side effects. "
+            "May be repeated."
+        ),
+    ),
+    runs_dir: str = typer.Option(".agentflow/runs", envvar="AGENTFLOW_RUNS_DIR"),
+    max_concurrent_runs: int = typer.Option(2, envvar="AGENTFLOW_MAX_CONCURRENT_RUNS"),
+    output: RunOutputFormat = typer.Option(
+        RunOutputFormat.AUTO,
+        "--output",
+        help="Result output format. Defaults to `summary` on a terminal and `json` otherwise.",
+    ),
+) -> None:
+    """Recover an interrupted run in place, preserving its run ID and source pin."""
+
+    store, orchestrator = _build_runtime(runs_dir, max_concurrent_runs)
+
+    async def _recover() -> None:
+        try:
+            record = await orchestrator.recover(
+                run_id,
+                completed_nodes=set(completed_node),
+            )
+        except KeyError as exc:
+            typer.echo(f"Run `{run_id}` not found in `{runs_dir}`.", err=True)
+            raise typer.Exit(code=1) from exc
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        typer.echo(f"Recovering run `{record.id}` in place.")
+        completed = await orchestrator.wait(record.id, timeout=None)
+        _echo_run_result(completed, output=output, run_dir=_run_dir_for_record(store, record.id))
+        raise typer.Exit(code=0 if _status_value(completed.status) == "completed" else 1)
+
+    asyncio.run(_recover())
+
+
+@app.command()
 def evolve(
     run_id: str,
     node: list[str] = typer.Option(..., "--node", "-n", help="Source node ids to harvest traces from."),
