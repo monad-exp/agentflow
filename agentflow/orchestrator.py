@@ -1450,6 +1450,12 @@ class Orchestrator:
             attempt_stderr_lines = BoundedLineBuffer()
             result.current_attempt = attempt_number
             result.attempts.append(attempt)
+            result.status = NodeStatus.RETRYING if attempt_number > 1 else NodeStatus.RUNNING
+            result.finished_at = None
+            # Persist the attempt before preparing or launching the runner so
+            # process-level recovery can cancel it and allocate a new attempt
+            # number without overwriting per-attempt artifacts.
+            await self.store.persist_run(run_id)
             parser.start_attempt(attempt_number)
             attempt_prompt = prompt
             if (
