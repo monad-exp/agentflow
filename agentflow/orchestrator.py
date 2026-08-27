@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import json
+import subprocess
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -897,6 +898,169 @@ class Orchestrator:
         self._start_background(new_run_id, lambda: self.run(new_run_id))
         return new_run
 
+    async def _validate_recovery_source(self, run_id: str, record: RunRecord) -> None:
+        declared = record.declared_pipeline or record.pipeline
+        requested_source = declared.source_snapshot
+        if requested_source is None:
+            return
+        source = record.source_snapshot
+        if source is None or source.commit_sha is None:
+            raise ValueError(
+                f"run `{run_id}` has no persisted source commit and cannot be recovered in place"
+            )
+
+        from agentflow.worktree import repository_root
+
+        repo_dir = await asyncio.to_thread(repository_root, declared.working_path)
+        relative_workdir = declared.working_path.relative_to(repo_dir)
+        worktree_dir = repo_dir / ".agentflow" / "worktrees" / run_id / "source"
+        expected_workdir = (worktree_dir / relative_workdir).resolve()
+        if record.pipeline.working_path.resolve() != expected_workdir:
+            raise ValueError(
+                f"run `{run_id}` does not reference its persisted source worktree"
+            )
+        if not worktree_dir.is_dir():
+            raise ValueError(
+                f"run `{run_id}` source worktree is missing: {worktree_dir}"
+            )
+
+        def inspect_worktree() -> tuple[str, str]:
+            head = subprocess.run(
+                ["git", "-C", str(worktree_dir), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", str(worktree_dir), "status", "--porcelain=v1", "--untracked-files=all"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            return head, status
+
+        try:
+            head, status = await asyncio.to_thread(inspect_worktree)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise ValueError(
+                f"run `{run_id}` source worktree could not be verified"
+            ) from exc
+        if head != source.commit_sha:
+            raise ValueError(
+                f"run `{run_id}` source worktree is at {head}, expected {source.commit_sha}"
+            )
+        if status:
+            raise ValueError(f"run `{run_id}` source worktree has local changes")
+
+        snapshot_path = self.store.run_artifact_dir(run_id) / "source-snapshot.json"
+        try:
+            artifact = SourceSnapshotSpec.model_validate_json(
+                snapshot_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValidationError) as exc:
+            raise ValueError(
+                f"run `{run_id}` source snapshot artifact is missing or invalid"
+            ) from exc
+        if artifact != source:
+            raise ValueError(
+                f"run `{run_id}` source snapshot artifact does not match persisted run state"
+            )
+        if (
+            source.repository_url != requested_source.repository_url
+            or source.input_ref != requested_source.input_ref
+        ):
+            raise ValueError(
+                f"run `{run_id}` source snapshot does not match its declared source"
+            )
+
+    async def recover(
+        self,
+        run_id: str,
+        *,
+        completed_nodes: set[str] | None = None,
+    ) -> RunRecord:
+        """Continue an interrupted run in place after validating durable state.
+
+        Unlike :meth:`resume`, recovery preserves the run ID, resolved pipeline,
+        source snapshot, runtime fan-out, events, attempts, and artifacts. The
+        caller must ensure no other scheduler is driving the run.
+        """
+
+        record = self.store.get_run(run_id)
+        if record.status == RunStatus.COMPLETED:
+            raise ValueError(f"run `{run_id}` is already completed")
+        active = self._run_finished.get(run_id)
+        if active is not None and not active.is_set():
+            raise ValueError(f"run `{run_id}` already has an active scheduler")
+
+        promoted = set(completed_nodes or set())
+        unknown = sorted(promoted - set(record.nodes))
+        if unknown:
+            raise ValueError(f"unknown recovery node IDs: {unknown}")
+        await self._validate_recovery_source(run_id, record)
+
+        recovered_at = utcnow_iso()
+        preserved: list[str] = []
+        reset: list[str] = []
+        for node_id, result in record.nodes.items():
+            if result.status == NodeStatus.COMPLETED:
+                preserved.append(node_id)
+                continue
+            for attempt in result.attempts:
+                if attempt.status in {
+                    NodeStatus.RUNNING,
+                    NodeStatus.QUEUED,
+                    NodeStatus.READY,
+                    NodeStatus.RETRYING,
+                }:
+                    attempt.status = NodeStatus.CANCELLED
+                    attempt.finished_at = attempt.finished_at or recovered_at
+            if node_id in promoted:
+                result.status = NodeStatus.COMPLETED
+                result.success = True
+                result.finished_at = recovered_at
+                result.current_attempt = len(result.attempts)
+                result.next_scheduled_at = None
+                result.success_details = [
+                    *result.success_details,
+                    "externally verified durable completion during in-place recovery",
+                ]
+                await self._publish(
+                    run_id,
+                    "node_recovery_completed",
+                    node_id=node_id,
+                    externally_verified=True,
+                )
+                await self.store.write_artifact_json(
+                    run_id,
+                    node_id,
+                    "result.json",
+                    result.model_dump(mode="json"),
+                )
+                continue
+            result.status = NodeStatus.PENDING
+            result.finished_at = None
+            result.current_attempt = len(result.attempts)
+            result.next_scheduled_at = None
+            result.success = None
+            result.exit_code = None
+            reset.append(node_id)
+
+        record.status = RunStatus.QUEUED
+        record.finished_at = None
+        self._initialize_run_tracking(run_id)
+        await self.store.clear_cancel_request(run_id)
+        await self._publish(
+            run_id,
+            "run_recovery_queued",
+            preserved_nodes=preserved,
+            promoted_nodes=sorted(promoted),
+            reset_nodes=reset,
+        )
+        await self.store.persist_run(run_id)
+        self._start_background(run_id, lambda: self.run(run_id, recovering=True))
+        return record
+
     def _should_cancel(self, run_id: str) -> bool:
         if self._cancel_flags.get(run_id, threading.Event()).is_set():
             return True
@@ -1217,7 +1381,9 @@ class Orchestrator:
         periodic_actions: _PeriodicActionEnvelope | None = None
         periodic_action_parse_error: str | None = None
 
-        for attempt_number in range(1, node.retries + 2):
+        first_attempt_number = len(result.attempts) + 1
+        for retry_index in range(node.retries + 1):
+            attempt_number = first_attempt_number + retry_index
             if self._should_cancel(run_id) or self._should_cancel_node(run_id, node_id):
                 reason = "run_cancelled" if self._should_cancel(run_id) else "node_cancelled"
                 await self._mark_node_cancelled(run_id, node_id, reason)
@@ -1281,7 +1447,7 @@ class Orchestrator:
                     "node_retrying",
                     node_id=node_id,
                     attempt=attempt_number,
-                    max_attempts=node.retries + 1,
+                    max_attempts=first_attempt_number + node.retries,
                 )
                 result.status = NodeStatus.RUNNING
 
@@ -1395,14 +1561,14 @@ class Orchestrator:
                 final_response=result.final_response,
                 success_details=result.success_details,
             )
-            if attempt_number <= node.retries:
+            if retry_index < node.retries:
                 if getattr(node, "retry_backoff_strategy", "exponential") == "exponential":
                     delay = min(
-                        node.retry_backoff_seconds * (2 ** (attempt_number - 1)),
+                        node.retry_backoff_seconds * (2 ** retry_index),
                         getattr(node, "retry_backoff_max_seconds", 300.0),
                     )
                 else:
-                    delay = node.retry_backoff_seconds * attempt_number
+                    delay = node.retry_backoff_seconds * (retry_index + 1)
                 retry_at = asyncio.get_running_loop().time() + max(delay, 0.0)
                 while (
                     asyncio.get_running_loop().time() < retry_at
@@ -1583,15 +1749,42 @@ class Orchestrator:
         await self.store.persist_run(run_id)
         return True
 
-    async def run(self, run_id: str) -> RunRecord:
+    async def run(self, run_id: str, *, recovering: bool = False) -> RunRecord:
         """Execute one run and always release its run-scoped resources."""
 
         try:
-            return await self._drive_run(run_id)
+            return await self._drive_run(run_id, recovering=recovering)
         finally:
             await self._cleanup_run_resources(run_id)
 
-    async def _drive_run(self, run_id: str) -> RunRecord:
+    async def _restore_connector_fanout_bindings(
+        self,
+        run_id: str,
+        record: RunRecord,
+    ) -> None:
+        node_map = record.pipeline.node_map
+        for template_id, member_ids in record.pipeline.fanouts.items():
+            template = node_map.get(template_id)
+            if (
+                template is None
+                or template.fanout_from is None
+                or template.fanout_from.connector is None
+            ):
+                continue
+            for member_id in member_ids:
+                member = node_map.get(member_id)
+                item_id = (
+                    member.fanout_member.get("value")
+                    if member is not None and member.fanout_member is not None
+                    else None
+                )
+                if member is None or not isinstance(item_id, str) or not item_id:
+                    raise ValueError(
+                        f"connector fan-out {template_id!r} has invalid persisted member {member_id!r}"
+                    )
+                self._connector_manager.bind_member(run_id, member, item_id)
+
+    async def _drive_run(self, run_id: str, *, recovering: bool = False) -> RunRecord:
         """Drive a run until all nodes reach terminal outcomes.
 
         The loop skips nodes blocked by upstream failure, queues nodes whose
@@ -1607,15 +1800,21 @@ class Orchestrator:
         pipeline = record.pipeline
         loop = asyncio.get_running_loop()
         record.status = RunStatus.RUNNING
-        record.started_at = utcnow_iso()
-        await self._publish(run_id, "run_started", pipeline=pipeline.model_dump(mode="json"))
+        if recovering:
+            await self._publish(
+                run_id,
+                "run_recovery_started",
+                source_snapshot=(
+                    record.source_snapshot.model_dump(mode="json", by_alias=True)
+                    if record.source_snapshot is not None
+                    else None
+                ),
+            )
+        else:
+            record.started_at = utcnow_iso()
+            await self._publish(run_id, "run_started", pipeline=pipeline.model_dump(mode="json"))
         await self.store.persist_run(run_id)
-        setup_steps = (
-            (
-                lambda: self._prepare_source_snapshot(run_id, record),
-                "source_setup_failed",
-                "source_snapshot_failed",
-            ),
+        setup_steps = [
             (
                 lambda: self._prepare_inference_service(run_id, record),
                 "inference_setup_failed",
@@ -1626,7 +1825,16 @@ class Orchestrator:
                 "connector_setup_failed",
                 "connectors_failed",
             ),
-        )
+        ]
+        if not recovering:
+            setup_steps.insert(
+                0,
+                (
+                    lambda: self._prepare_source_snapshot(run_id, record),
+                    "source_setup_failed",
+                    "source_snapshot_failed",
+                ),
+            )
         for operation, skip_reason, event_type in setup_steps:
             if self._should_cancel(run_id):
                 break
@@ -1640,6 +1848,16 @@ class Orchestrator:
                     event_type=event_type,
                 )
             pipeline = record.pipeline
+        if recovering:
+            try:
+                await self._restore_connector_fanout_bindings(run_id, record)
+            except Exception as exc:  # noqa: BLE001 - fail before scheduling nodes.
+                return await self._fail_setup(
+                    run_id,
+                    exc,
+                    skip_reason="connector_rebind_failed",
+                    event_type="connector_rebind_failed",
+                )
 
         # Setup phases own their specific timeouts. The workflow deadline starts
         # only after setup so an uninterruptible thread-backed Git or cloud launch
@@ -1679,6 +1897,7 @@ class Orchestrator:
             if node.fanout_from is not None
         }
         runtime_expanded = set(record.pipeline.fanouts) & set(runtime_templates)
+        remaining.difference_update(runtime_expanded)
         pool_semaphores = {
             name: asyncio.Semaphore(limit)
             for name, limit in pipeline.concurrency_pools.items()

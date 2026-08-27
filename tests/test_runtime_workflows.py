@@ -13,7 +13,17 @@ from agentflow.agents.base import AgentAdapter
 from agentflow.orchestrator import Orchestrator
 from agentflow.prepared import ExecutionPaths, PreparedExecution
 from agentflow.runners.registry import RunnerRegistry
-from agentflow.specs import AgentKind, NodeStatus, PipelineSpec, RunRecord, RunStatus
+from agentflow.specs import (
+    AgentKind,
+    NodeAttempt,
+    NodeResult,
+    NodeStatus,
+    PipelineSpec,
+    RunRecord,
+    RunStatus,
+    SourceSnapshotSpec,
+    expand_runtime_fanout_node,
+)
 from agentflow.store import RunStore
 
 from tests.test_orchestrator import MockAdapter
@@ -886,6 +896,212 @@ async def test_resume_rejects_source_pinned_run(tmp_path: Path):
 
     with pytest.raises(ValueError, match="source-pinned runs"):
         await orchestrator.resume(failed.id)
+
+
+@pytest.mark.asyncio
+async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_path: Path):
+    class RecoveryConnectorManager:
+        def __init__(self):
+            self.started: list[str] = []
+            self.bound: list[tuple[str, str, str]] = []
+            self.stopped: list[str] = []
+
+        async def start(self, run_id, _pipeline, _run_dir):
+            self.started.append(run_id)
+
+        async def fetch_collection(self, _run_id, _connector, _resource):
+            raise AssertionError("persisted fan-out must not be expanded again")
+
+        def bind_member(self, run_id, node, item_id):
+            self.bound.append((run_id, node.id, item_id))
+
+        async def stop(self, run_id):
+            self.stopped.append(run_id)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _git(repo, "config", "user.email", "tests@example.test")
+    _git(repo, "config", "user.name", "AgentFlow Tests")
+    (repo / "source.txt").write_text("pinned\n", encoding="utf-8")
+    _git(repo, "add", "source.txt")
+    _git(repo, "commit", "-q", "-m", "source")
+    commit_sha = _git(repo, "rev-parse", "HEAD")
+
+    orchestrator = _orchestrator(tmp_path)
+    run_id = orchestrator.store.new_run_id()
+    from agentflow.worktree import create_pinned_worktree
+
+    source_worktree = create_pinned_worktree(repo, run_id, commit_sha)
+    declared = PipelineSpec.model_validate(
+        {
+            "name": "recover-connector-source",
+            "working_dir": str(repo),
+            "source_snapshot": {
+                "repositoryUrl": "https://example.test/repository.git",
+                "inputRef": "HEAD",
+            },
+            "connectors": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:{port}/mcp",
+                    "control_url": "http://127.0.0.1:{port}/orchestration",
+                    "command": "unused",
+                }
+            ],
+            "nodes": [
+                {"id": "rank", "agent": "codex", "prompt": "rank"},
+                {
+                    "id": "hunt",
+                    "agent": "codex",
+                    "prompt": "hunt",
+                    "depends_on": ["rank"],
+                    "connectors": ["bugdb"],
+                    "fanout_from": {
+                        "from": "rank",
+                        "connector": "bugdb",
+                        "resource": "hunts",
+                    },
+                },
+                {
+                    "id": "report",
+                    "agent": "codex",
+                    "prompt": "report",
+                    "depends_on": ["hunt"],
+                },
+            ],
+        }
+    )
+    execution = declared.model_copy(deep=True)
+    execution.working_dir = str(source_worktree)
+    hunt_template = execution.node_map["hunt"]
+    members, member_ids = expand_runtime_fanout_node(hunt_template, ["hunt-durable"])
+    execution.nodes.extend(members)
+    execution.fanouts["hunt"] = member_ids
+    source = SourceSnapshotSpec(
+        repositoryUrl="https://example.test/repository.git",
+        inputRef="HEAD",
+        commitSha=commit_sha,
+    )
+    interrupted_attempt = NodeAttempt(
+        number=1,
+        status=NodeStatus.RUNNING,
+        started_at="2026-01-01T00:00:00+00:00",
+    )
+    record = RunRecord(
+        id=run_id,
+        status=RunStatus.RUNNING,
+        pipeline=execution,
+        declared_pipeline=declared,
+        source_snapshot=source,
+        nodes={
+            "rank": NodeResult(
+                node_id="rank",
+                status=NodeStatus.RUNNING,
+                attempts=[interrupted_attempt.model_copy(deep=True)],
+            ),
+            "hunt": NodeResult(
+                node_id="hunt",
+                status=NodeStatus.RUNNING,
+                structured_output=["hunt-durable"],
+            ),
+            "hunt_0": NodeResult(
+                node_id="hunt_0",
+                status=NodeStatus.RUNNING,
+                attempts=[interrupted_attempt.model_copy(deep=True)],
+            ),
+            "report": NodeResult(node_id="report", status=NodeStatus.SKIPPED),
+        },
+    )
+    await orchestrator.store.create_run(record)
+    await orchestrator.store.write_run_artifact_json(
+        run_id,
+        "source-snapshot.json",
+        source.model_dump(mode="json", by_alias=True),
+    )
+    connector_manager = RecoveryConnectorManager()
+    orchestrator._connector_manager = connector_manager
+
+    recovered = await orchestrator.recover(run_id, completed_nodes={"rank"})
+    completed = await orchestrator.wait(recovered.id, timeout=5)
+
+    assert recovered.id == run_id
+    assert completed.status == RunStatus.COMPLETED
+    assert completed.source_snapshot == source
+    assert completed.nodes["rank"].status == NodeStatus.COMPLETED
+    assert completed.nodes["hunt"].status == NodeStatus.COMPLETED
+    assert completed.nodes["hunt_0"].status == NodeStatus.COMPLETED
+    assert completed.nodes["report"].status == NodeStatus.COMPLETED
+    assert [attempt.number for attempt in completed.nodes["hunt_0"].attempts] == [1, 2]
+    assert completed.nodes["hunt_0"].attempts[0].status == NodeStatus.CANCELLED
+    assert connector_manager.started == [run_id]
+    assert connector_manager.bound == [(run_id, "hunt_0", "hunt-durable")]
+    assert connector_manager.stopped == [run_id]
+    event_types = [event.type for event in orchestrator.store.get_events(run_id)]
+    assert "run_recovery_queued" in event_types
+    assert "run_recovery_started" in event_types
+    assert "node_recovery_completed" in event_types
+    assert "source_snapshot_persisted" not in event_types
+    assert not source_worktree.exists()
+
+
+@pytest.mark.asyncio
+async def test_recover_rejects_dirty_pinned_source_worktree(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _git(repo, "config", "user.email", "tests@example.test")
+    _git(repo, "config", "user.name", "AgentFlow Tests")
+    (repo / "source.txt").write_text("pinned\n", encoding="utf-8")
+    _git(repo, "add", "source.txt")
+    _git(repo, "commit", "-q", "-m", "source")
+    commit_sha = _git(repo, "rev-parse", "HEAD")
+
+    orchestrator = _orchestrator(tmp_path)
+    run_id = orchestrator.store.new_run_id()
+    from agentflow.worktree import create_pinned_worktree, remove_worktree
+
+    source_worktree = create_pinned_worktree(repo, run_id, commit_sha)
+    declared = PipelineSpec.model_validate(
+        {
+            "name": "dirty-source-recovery",
+            "working_dir": str(repo),
+            "source_snapshot": {
+                "repositoryUrl": "https://example.test/repository.git",
+                "inputRef": "HEAD",
+            },
+            "nodes": [{"id": "scan", "agent": "codex", "prompt": "scan"}],
+        }
+    )
+    execution = declared.model_copy(deep=True)
+    execution.working_dir = str(source_worktree)
+    source = SourceSnapshotSpec(
+        repositoryUrl="https://example.test/repository.git",
+        inputRef="HEAD",
+        commitSha=commit_sha,
+    )
+    record = RunRecord(
+        id=run_id,
+        status=RunStatus.FAILED,
+        pipeline=execution,
+        declared_pipeline=declared,
+        source_snapshot=source,
+        nodes={"scan": NodeResult(node_id="scan", status=NodeStatus.FAILED)},
+    )
+    await orchestrator.store.create_run(record)
+    await orchestrator.store.write_run_artifact_json(
+        run_id,
+        "source-snapshot.json",
+        source.model_dump(mode="json", by_alias=True),
+    )
+    (source_worktree / "unexpected.txt").write_text("dirty\n", encoding="utf-8")
+
+    try:
+        with pytest.raises(ValueError, match="local changes"):
+            await orchestrator.recover(run_id)
+        assert record.status == RunStatus.FAILED
+    finally:
+        remove_worktree(repo, source_worktree)
 
 
 @pytest.mark.asyncio
