@@ -132,6 +132,31 @@ def test_pi_trace_parser_omits_cumulative_partial_from_delta_raw_payload():
     assert len(json.dumps(event.raw)) < 200
 
 
+def test_pi_trace_parser_emits_compact_reasoning_delta_events():
+    parser = create_trace_parser(AgentKind.PI, "scan")
+    line = json.dumps(
+        {
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "thinking_delta",
+                "contentIndex": 0,
+                "delta": "checking",
+                "partial": {"content": "x" * 100_000},
+            },
+        }
+    )
+
+    event = parser.feed(line)[0]
+
+    assert event.kind == "reasoning_delta"
+    assert event.content == "checking"
+    assert event.raw["assistantMessageEvent"] == {
+        "type": "thinking_delta",
+        "contentIndex": 0,
+        "delta": "checking",
+    }
+
+
 def test_pi_trace_parser_prefers_agent_end_when_present():
     parser = create_trace_parser(AgentKind.PI, "scan")
     # Only feed agent_end with a single assistant message.

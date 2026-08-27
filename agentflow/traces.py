@@ -425,6 +425,14 @@ class PiTraceParser(BaseTraceParser):
                 content = inner.get("content")
                 if isinstance(content, str):
                     events.append(self.emit("assistant_text", "Assistant text", content, compact_raw))
+            elif sub_type == "thinking_delta":
+                delta = inner.get("delta")
+                if isinstance(delta, str):
+                    events.append(self.emit("reasoning_delta", "Reasoning delta", delta, compact_raw))
+            elif sub_type == "thinking_end":
+                content = inner.get("content")
+                if isinstance(content, str):
+                    events.append(self.emit("reasoning_text", "Reasoning text", content, compact_raw))
             return events
 
         if event_type == "turn_end":

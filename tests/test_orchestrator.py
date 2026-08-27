@@ -1290,7 +1290,7 @@ for index in range(40):
     print(json.dumps({
         "type": "message_update",
         "assistantMessageEvent": {
-            "type": "text_delta",
+            "type": "thinking_delta",
             "contentIndex": 0,
             "delta": "x",
             "partial": {"content": partial},
@@ -1341,7 +1341,7 @@ print(json.dumps({
     completed = await orchestrator.wait(run.id, timeout=5)
     node = completed.nodes["scan"]
     stdout_log = orchestrator.store.read_artifact_text(completed.id, "scan", "stdout.log")
-    delta_events = [event for event in node.trace_events if event.kind == "assistant_delta"]
+    delta_events = [event for event in node.trace_events if event.kind == "reasoning_delta"]
 
     assert completed.status.value == "completed"
     assert node.final_response == "pi done"
