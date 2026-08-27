@@ -975,6 +975,44 @@ async def test_orchestrator_retries_failed_nodes(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_persists_active_attempt_before_runner_launch(tmp_path: Path):
+    orchestrator = make_orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "persist-active-attempt",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {
+                    "id": "slow",
+                    "agent": "codex",
+                    "prompt": "persist before launch",
+                    "timeout_seconds": 30,
+                }
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    launch_path = orchestrator.store.artifact_path(submitted.id, "slow", "launch-attempt-1.json")
+    deadline = asyncio.get_running_loop().time() + 2
+    while asyncio.get_running_loop().time() < deadline and not launch_path.exists():
+        await asyncio.sleep(0.01)
+    assert launch_path.exists()
+
+    persisted = RunStore(tmp_path / "runs").get_run(submitted.id)
+    node = persisted.nodes["slow"]
+    assert node.status.value == "running"
+    assert node.current_attempt == 1
+    assert len(node.attempts) == 1
+    assert node.attempts[0].number == 1
+    assert node.attempts[0].status.value == "running"
+
+    await orchestrator.cancel(submitted.id)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+    assert completed.status.value == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_retry_isolates_final_capture_from_failed_attempt_stdout(tmp_path: Path):
     orchestrator = make_orchestrator(tmp_path)
     pipeline = PipelineSpec.model_validate(
