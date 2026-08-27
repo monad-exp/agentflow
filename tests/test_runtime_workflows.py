@@ -1107,8 +1107,10 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
             ),
             "hunt": NodeResult(
                 node_id="hunt",
-                status=NodeStatus.RUNNING,
+                status=NodeStatus.COMPLETED,
                 structured_output=["hunt-durable"],
+                success=True,
+                finished_at="2026-01-01T00:00:01+00:00",
             ),
             "hunt_0": NodeResult(
                 node_id="hunt_0",

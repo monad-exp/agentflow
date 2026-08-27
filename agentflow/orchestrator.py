@@ -1014,11 +1014,36 @@ class Orchestrator:
             raise ValueError(f"unknown recovery node IDs: {unknown}")
         await self._validate_recovery_source(run_id, record)
 
+        # A prior scheduler may have persisted a fan-out template as completed
+        # while one of its members was only between retry attempts. Invalidate
+        # that template and its downstream closure before deciding which
+        # completed results are safe to preserve. Completed sibling members are
+        # still durable and remain untouched.
+        invalidated = {
+            template_id
+            for template_id, member_ids in record.pipeline.fanouts.items()
+            if any(
+                record.nodes[member_id].status != NodeStatus.COMPLETED
+                and member_id not in promoted
+                for member_id in member_ids
+            )
+        }
+        while True:
+            downstream = {
+                node.id
+                for node in record.pipeline.nodes
+                if node.id not in invalidated
+                and any(dependency in invalidated for dependency in node.depends_on)
+            }
+            if not downstream:
+                break
+            invalidated.update(downstream)
+
         recovered_at = utcnow_iso()
         preserved: list[str] = []
         reset: list[str] = []
         for node_id, result in record.nodes.items():
-            if result.status == NodeStatus.COMPLETED:
+            if result.status == NodeStatus.COMPLETED and node_id not in invalidated:
                 preserved.append(node_id)
                 continue
             for attempt in result.attempts:
