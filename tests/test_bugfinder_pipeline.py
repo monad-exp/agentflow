@@ -19,7 +19,7 @@ def test_bugfinder_factory_builds_the_production_graph(tmp_path: Path):
             repository_url="https://example.test/repository.git",
             input_ref="main",
             historical_context="Prior bug in {{ dangerous_template }}.",
-            environment={"BUGFINDER_AGENT": "codex"},
+            environment={"BUGFINDER_AGENT": "codex", "BUGFINDER_RETRIES": "4"},
         )
     ).to_spec()
 
@@ -48,8 +48,11 @@ def test_bugfinder_factory_builds_the_production_graph(tmp_path: Path):
     assert pipeline.connectors[0].tools == []
     assert pipeline.deadline_seconds == 14400
     assert pipeline.node_map["hunt"].durable_goal is not None
+    assert pipeline.node_map["deduplicate"].durable_goal is not None
+    assert pipeline.node_map["deduplicate"].durable_goal.mode == "supervised"
     assert pipeline.node_map["rank_files"].durable_goal is None
-    assert pipeline.node_map["deduplicate"].retries == 0
+    assert pipeline.node_map["deduplicate"].retries == 4
+    assert "before reaching the response limit" in pipeline.node_map["deduplicate"].prompt
     assert "historical category or bug pattern" in pipeline.node_map["threat_model"].prompt
     threat = pipeline.node_map["threat_model"]
     assert threat.input == {
