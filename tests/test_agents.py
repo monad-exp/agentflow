@@ -550,6 +550,24 @@ def test_pi_adapter_uses_pi_cli_directly(tmp_path):
     assert "Review" not in prepared.command
 
 
+def test_pi_adapter_resumes_node_scoped_session_for_supervised_durable_goal(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "hunt",
+            "agent": "pi",
+            "prompt": "Hunt",
+            "durable_goal": {"mode": "supervised"},
+        }
+    )
+
+    prepared = PiAdapter().prepare(node, "Hunt", _paths(tmp_path))
+
+    assert "--no-session" not in prepared.command
+    assert "--continue" in prepared.command
+    session_dir_index = prepared.command.index("--session-dir")
+    assert prepared.command[session_dir_index + 1] == str(tmp_path / ".runtime" / "pi-sessions")
+
+
 def test_pi_adapter_read_only_tool_mapping(tmp_path):
     node = NodeSpec.model_validate(
         {"id": "scan", "agent": "pi", "prompt": "Scan", "tools": "read_only"}

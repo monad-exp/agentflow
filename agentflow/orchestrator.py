@@ -1464,8 +1464,10 @@ class Orchestrator:
                 and attempt_number > 1
             ):
                 attempt_prompt += (
-                    "\n\nAgentFlow supervised durable-goal resume: re-read durable connector state "
-                    "and reuse the same idempotency keys."
+                    "\n\nAgentFlow supervised durable-goal resume: continue from durable connector "
+                    "state and reuse the same idempotency keys. Do not repeat completed work. Keep "
+                    "analysis and tool use concise, persist useful progress incrementally, and call "
+                    "the required durable completion tool before reaching the response limit."
                 )
             prepared = adapter.prepare(adapter_node, attempt_prompt, paths)
             # Forward local credentials to remote targets when enabled
