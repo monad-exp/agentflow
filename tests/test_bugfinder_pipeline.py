@@ -52,6 +52,8 @@ def test_bugfinder_factory_builds_the_production_graph(tmp_path: Path):
     assert pipeline.node_map["deduplicate"].durable_goal.mode == "supervised"
     assert pipeline.node_map["rank_files"].durable_goal is None
     assert pipeline.node_map["deduplicate"].retries == 4
+    assert "at most 1,500 tokens" in pipeline.node_map["deduplicate"].prompt
+    assert "your next substantive action" in pipeline.node_map["deduplicate"].prompt
     assert "before reaching the response limit" in pipeline.node_map["deduplicate"].prompt
     assert "historical category or bug pattern" in pipeline.node_map["threat_model"].prompt
     threat = pipeline.node_map["threat_model"]
