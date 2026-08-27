@@ -83,7 +83,7 @@ def test_bugfinder_schema_and_scripts_stay_minimal():
     assert package["scripts"]["pretest"] == "npm run prisma:generate"
 
 
-def test_bugfinder_configures_glm_pi_capabilities_and_bounded_dedup_reasoning(
+def test_bugfinder_configures_glm_pi_capabilities_and_xhigh_reasoning_for_every_pi_role(
     tmp_path: Path,
 ):
     pipeline = build_pipeline(
@@ -98,9 +98,19 @@ def test_bugfinder_configures_glm_pi_capabilities_and_bounded_dedup_reasoning(
         )
     ).to_spec()
 
-    deduplicate = pipeline.node_map["deduplicate"]
-    assert deduplicate.provider is not None
-    assert deduplicate.provider.model_reasoning is True
-    assert deduplicate.provider.model_context_window == 1048576
-    assert deduplicate.provider.model_max_tokens == 65536
-    assert deduplicate.extra_args[-2:] == ["--thinking", "low"]
+    pi_nodes = [node for node in pipeline.nodes if node.agent == AgentKind.PI]
+    assert {node.id for node in pi_nodes} == {
+        "rank_files",
+        "threat_model",
+        "roam_plan",
+        "hunt",
+        "deduplicate",
+        "triage",
+        "rereview",
+    }
+    for node in pi_nodes:
+        assert node.provider is not None
+        assert node.provider.model_reasoning is True
+        assert node.provider.model_context_window == 1048576
+        assert node.provider.model_max_tokens == 65536
+        assert node.extra_args[-2:] == ["--thinking", "xhigh"]

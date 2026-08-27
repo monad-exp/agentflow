@@ -112,12 +112,9 @@ def role_agent(config: BugfinderConfig, role: str, **kwargs: Any):
                 ),
                 model_max_tokens=int(config.setting("BUGFINDER_PI_MAX_TOKENS", "65536")),
             )
-            if role == "deduplicate":
-                extra_args = list(kwargs.get("extra_args", []))
-                extra_args.extend(
-                    ["--thinking", config.setting("BUGFINDER_PI_DEDUP_THINKING", "low")]
-                )
-                kwargs["extra_args"] = extra_args
+            extra_args = list(kwargs.get("extra_args", []))
+            extra_args.extend(["--thinking", "xhigh"])
+            kwargs["extra_args"] = extra_args
         kwargs["provider"] = pi_provider
     return builders[selected](**kwargs)
 
