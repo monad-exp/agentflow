@@ -93,16 +93,32 @@ def role_agent(config: BugfinderConfig, role: str, **kwargs: Any):
     elif selected == "claude" and config.environment.get("BUGFINDER_CLAUDE_MODEL"):
         kwargs["model"] = config.environment["BUGFINDER_CLAUDE_MODEL"]
     elif selected == "pi":
-        kwargs["model"] = config.setting(
+        pi_model = config.setting(
             "BUGFINDER_PI_MODEL",
             "openrouter/anthropic/claude-sonnet-4.6",
         )
-        kwargs["provider"] = {
+        kwargs["model"] = pi_model
+        pi_provider: dict[str, Any] = {
             "name": "openrouter",
             "base_url": "https://openrouter.ai/api/v1",
             "api_key_env": "OPENROUTER_API_KEY",
             "wire_api": "openai-completions",
         }
+        if pi_model.split(":", 1)[0] == "openrouter/z-ai/glm-5.3":
+            pi_provider.update(
+                model_reasoning=True,
+                model_context_window=int(
+                    config.setting("BUGFINDER_PI_CONTEXT_WINDOW", "1048576")
+                ),
+                model_max_tokens=int(config.setting("BUGFINDER_PI_MAX_TOKENS", "65536")),
+            )
+            if role == "deduplicate":
+                extra_args = list(kwargs.get("extra_args", []))
+                extra_args.extend(
+                    ["--thinking", config.setting("BUGFINDER_PI_DEDUP_THINKING", "low")]
+                )
+                kwargs["extra_args"] = extra_args
+        kwargs["provider"] = pi_provider
     return builders[selected](**kwargs)
 
 

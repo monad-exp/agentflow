@@ -81,3 +81,26 @@ def test_bugfinder_schema_and_scripts_stay_minimal():
     assert "ALTER DEFAULT PRIVILEGES" not in migration
     assert package["scripts"]["prebuild"] == "npm run prisma:generate"
     assert package["scripts"]["pretest"] == "npm run prisma:generate"
+
+
+def test_bugfinder_configures_glm_pi_capabilities_and_bounded_dedup_reasoning(
+    tmp_path: Path,
+):
+    pipeline = build_pipeline(
+        BugfinderConfig(
+            repository=tmp_path,
+            repository_url="https://example.test/repository.git",
+            input_ref="main",
+            environment={
+                "BUGFINDER_AGENT": "pi",
+                "BUGFINDER_PI_MODEL": "openrouter/z-ai/glm-5.3",
+            },
+        )
+    ).to_spec()
+
+    deduplicate = pipeline.node_map["deduplicate"]
+    assert deduplicate.provider is not None
+    assert deduplicate.provider.model_reasoning is True
+    assert deduplicate.provider.model_context_window == 1048576
+    assert deduplicate.provider.model_max_tokens == 65536
+    assert deduplicate.extra_args[-2:] == ["--thinking", "low"]
