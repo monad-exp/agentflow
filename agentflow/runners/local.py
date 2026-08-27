@@ -360,8 +360,18 @@ class LocalRunner(Runner):
                     cancelled = True
                     break
                 check_timeout = min(remaining or 1.0, 1.0)
-                monitored_tasks = {stdout_task, stderr_task, wait_task}
-                if external_task is not None:
+                # Completed stream readers must not stay in a FIRST_COMPLETED
+                # wait. A stream can reach EOF before the process exits; keeping
+                # its completed task here turns this loop into a zero-timeout
+                # busy spin. Both streams reaching EOF is not an authoritative
+                # process completion signal either, so continue monitoring the
+                # process until it exits, is cancelled, or reaches its deadline.
+                monitored_tasks = {wait_task}
+                if not stdout_task.done():
+                    monitored_tasks.add(stdout_task)
+                if not stderr_task.done():
+                    monitored_tasks.add(stderr_task)
+                if external_task is not None and not external_task.done():
                     monitored_tasks.add(external_task)
                 done, _ = await asyncio.wait(
                     monitored_tasks,
@@ -374,22 +384,6 @@ class LocalRunner(Runner):
                     break
                 if external_task is not None and external_task in done:
                     external_exit_code = external_task.result()
-                    break
-                if stdout_task in done and stderr_task in done:
-                    # Both streams EOF'd — process should follow shortly
-                    if not wait_task.done():
-                        completion_tasks = {wait_task}
-                        if external_task is not None:
-                            completion_tasks.add(external_task)
-                        completed, _ = await asyncio.wait(
-                            completion_tasks,
-                            timeout=5,
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        if external_task is not None and external_task in completed:
-                            external_exit_code = external_task.result()
-                        elif wait_task not in completed:
-                            timed_out = True
                     break
         except Exception:
             timed_out = True
