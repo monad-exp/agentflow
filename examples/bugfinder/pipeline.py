@@ -75,12 +75,12 @@ def role_agent(config: BugfinderConfig, role: str, **kwargs: Any):
         raise ValueError(f"unsupported {role} agent {selected!r}; choose codex, claude, or pi")
     kwargs.setdefault("connectors", ["bugdb"])
     kwargs.setdefault("concurrency_pool", f"{selected}-provider")
-    if role == "hunt":
+    if role in {"hunt", "deduplicate"}:
         kwargs.setdefault(
             "durable_goal",
             {"mode": config.setting("BUGFINDER_GOAL_MODE", "supervised")},
         )
-    retryable = role in {"hunt", "triage", "rereview"}
+    retryable = role in {"hunt", "deduplicate", "triage", "rereview"}
     kwargs.setdefault(
         "retries",
         int(config.setting("BUGFINDER_RETRIES", "1")) if retryable else 0,
