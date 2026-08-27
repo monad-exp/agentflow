@@ -227,16 +227,32 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
   });
 
   test("the app role cannot mutate canonical fields and the schema contains no JSON", async () => {
-    const hunts = await prisma.hunt.findMany({ where: { runId }, take: 1 });
-    const findings = await prisma.finding.findMany({ where: { runId }, take: 1 });
+    const privilegeRunId = `privilege-${randomUUID()}`;
+    const [hunt] = await addHunts(prisma, { runId: privilegeRunId }, {
+      hunts: [{
+        callerKey: "privilege-fixture",
+        kind: HuntKind.ROAM,
+        objective: "Provide an independent fixture for database privilege checks.",
+        paths: [],
+      }],
+    });
+    const finding = await prisma.finding.create({
+      data: {
+        id: `finding-${randomUUID()}`,
+        runId: privilegeRunId,
+        title: "Privilege fixture",
+        rootCause: "The privilege test needs a self-contained Finding.",
+        impact: "None; this row exists only for the database test.",
+      },
+    });
     await expect(
-      prisma.hunt.update({ where: { id: hunts[0].id }, data: { objective: "forbidden mutation" } }),
+      prisma.hunt.update({ where: { id: hunt.id }, data: { objective: "forbidden mutation" } }),
     ).rejects.toThrow();
     await expect(
       prisma.hunt.create({
         data: {
           id: `forbidden-result-${randomUUID()}`,
-          runId,
+          runId: privilegeRunId,
           kind: HuntKind.ROAM,
           objective: "Cannot insert a pre-finished Hunt.",
           paths: [],
@@ -249,8 +265,8 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
       prisma.lead.create({
         data: {
           id: `forbidden-finding-${randomUUID()}`,
-          huntId: hunts[0].id,
-          findingId: findings[0].id,
+          huntId: hunt.id,
+          findingId: finding.id,
           claim: "Cannot insert a pre-assigned Lead.",
           locations: ["src/forbidden.ts:1"],
           evidence: "Forbidden direct membership.",
@@ -261,7 +277,7 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
       prisma.finding.create({
         data: {
           id: `forbidden-review-${randomUUID()}`,
-          runId,
+          runId: privilegeRunId,
           title: "Cannot insert a pre-reviewed Finding",
           rootCause: "Forbidden direct review fields.",
           impact: "The write must fail.",
