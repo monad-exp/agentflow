@@ -22,6 +22,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agentflow.contracts import check_json_schema
 from agentflow.local_shell import (
     invalid_bash_long_option_error,
     shell_init_commands,
@@ -73,6 +74,7 @@ class NodeStatus(StrEnum):
     RETRYING = "retrying"
     COMPLETED = "completed"
     FAILED = "failed"
+    TIMED_OUT = "timed_out"
     SKIPPED = "skipped"
     CANCELLED = "cancelled"
 
@@ -159,6 +161,7 @@ _KIMI_ANTHROPIC_BASE_URL = "https://api.kimi.com/coding/"
 _LOCAL_KIMI_BOOTSTRAP_SHELL_INIT = ("command -v kimi >/dev/null 2>&1", "kimi")
 _LOCAL_BOOTSTRAP_TARGET_KEYS = ("shell", "shell_login", "shell_interactive", "shell_init")
 _FANOUT_ALIAS_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CONNECTOR_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 _FANOUT_RESERVED_CONTEXT_NAMES = {"fanout", "fanouts", "nodes", "pipeline"}
 _FANOUT_MEMBER_RESERVED_NAMES = {"index", "number", "count", "suffix", "value", "template_id", "node_id"}
 _FANOUT_TEMPLATE_PATTERN = re.compile(r"{{\s*(?P<expr>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*}}")
@@ -171,8 +174,9 @@ _NODE_DEFAULT_FORBIDDEN_FIELDS = {
     "fanout_group",
     "fanout_member",
     "fanout_dependencies",
+    "fanout_from",
 }
-_NODE_DEFAULT_LIST_MERGE_FIELDS = {"extra_args", "skills", "mcps"}
+_NODE_DEFAULT_LIST_MERGE_FIELDS = {"connectors", "extra_args", "skills", "mcps"}
 _NODE_DEFAULT_DICT_MERGE_FIELDS = {"env", "provider"}
 
 
@@ -360,6 +364,106 @@ class MCPServerSpec(BaseModel):
             joined = ", ".join(f"`{field}`" for field in unsupported_fields)
             raise ValueError(f"{self.transport} MCP servers do not support {joined}")
         return self
+
+
+class ConnectorToolSpec(BaseModel):
+    """One logical tool exposed by a run-scoped connector."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str
+    input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
+
+    @field_validator("name", "description")
+    @classmethod
+    def validate_required_text(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"`connectors[].tools[].{info.field_name}` must not be empty")
+        if info.field_name == "name" and not _CONNECTOR_IDENTIFIER_PATTERN.fullmatch(normalized):
+            raise ValueError("connector tool names may contain only letters, digits, `_`, and `-`")
+        return normalized
+
+    @field_validator("input_schema")
+    @classmethod
+    def validate_input_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
+        check_json_schema(value, label="connector tool input_schema")
+        return value
+
+
+class ConnectorSpec(BaseModel):
+    """A tool service whose process and credentials are owned by AgentFlow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    transport: Literal["streamable_http"] = "streamable_http"
+    url: str
+    control_url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    cwd: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    env_from: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    tools: list[ConnectorToolSpec] = Field(default_factory=list)
+    startup_timeout_seconds: float = Field(default=15.0, gt=0)
+    shutdown_timeout_seconds: float = Field(default=5.0, gt=0)
+
+    @field_validator("name", "url")
+    @classmethod
+    def validate_required_text(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"`connectors[].{info.field_name}` must not be empty")
+        if info.field_name == "name" and not _CONNECTOR_IDENTIFIER_PATTERN.fullmatch(normalized):
+            raise ValueError("connector names may contain only letters, digits, `_`, and `-`")
+        return normalized
+
+    @field_validator("command", "control_url", "cwd")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_tools(self) -> "ConnectorSpec":
+        if self.command is not None and "{port}" not in self.url:
+            raise ValueError(
+                f"managed connector {self.name!r} must use a run-scoped {{port}} URL"
+            )
+        if self.command is None and "{port}" in self.url:
+            raise ValueError(
+                f"connector {self.name!r} uses {{port}} without a managed command"
+            )
+        if (
+            self.command is not None
+            and self.control_url is not None
+            and "{port}" not in self.control_url
+        ):
+            raise ValueError(
+                f"managed connector {self.name!r} must use {{port}} in control_url"
+            )
+        duplicate_tools = sorted(
+            name for name, count in Counter(tool.name for tool in self.tools).items() if count > 1
+        )
+        if duplicate_tools:
+            raise ValueError(f"connector {self.name!r} has duplicate tool names: {duplicate_tools}")
+        return self
+
+
+class ConnectorBindingSpec(BaseModel):
+    """Resolved connector metadata carried to adapters without credentials."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    tools: list[ConnectorToolSpec] = Field(default_factory=list)
 
 
 class LocalTarget(BaseModel):
@@ -1388,12 +1492,29 @@ class FileNonEmptyCriterion(BaseModel):
     path: str
 
 
+class ConnectorToolCalledCriterion(BaseModel):
+    """Require a completed connector tool call in the normalized trace."""
+
+    kind: Literal["connector_tool_called"] = "connector_tool_called"
+    connector: str
+    tool: str
+
+    @field_validator("connector", "tool")
+    @classmethod
+    def validate_connector_tool_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("connector tool success criteria require non-empty names")
+        return normalized
+
+
 SuccessCriterion = Annotated[
     OutputContainsCriterion
     | OutputRegexCriterion
     | FileExistsCriterion
     | FileContainsCriterion
-    | FileNonEmptyCriterion,
+    | FileNonEmptyCriterion
+    | ConnectorToolCalledCriterion,
     Field(discriminator="kind"),
 ]
 
@@ -1609,6 +1730,51 @@ class PeriodicScheduleSpec(BaseModel):
         return normalized
 
 
+class RuntimeFanoutSpec(BaseModel):
+    """Expand a node from structured output or a connector-owned durable collection."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    from_: str = Field(alias="from")
+    path: str = "$"
+    as_: str = Field(default="item", alias="as")
+    max_items: int = Field(default=1000, ge=1)
+    connector: str | None = None
+    resource: str | None = None
+
+    @field_validator("from_", "path", "as_")
+    @classmethod
+    def validate_text(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"`fanout_from.{info.field_name.rstrip('_')}` must not be empty")
+        if info.field_name == "as_":
+            if normalized in _FANOUT_RESERVED_CONTEXT_NAMES:
+                raise ValueError("`fanout_from.as` uses a reserved template variable name")
+            if not _FANOUT_ALIAS_PATTERN.fullmatch(normalized):
+                raise ValueError("`fanout_from.as` must be a valid template variable name")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_connector_source(self) -> "RuntimeFanoutSpec":
+        if (self.connector is None) != (self.resource is None):
+            raise ValueError("`fanout_from.connector` and `fanout_from.resource` must be set together")
+        if self.connector is not None:
+            self.connector = self.connector.strip()
+            self.resource = self.resource.strip() if self.resource is not None else None
+            if not self.connector or not self.resource:
+                raise ValueError("connector-backed runtime fan-out requires non-empty connector and resource names")
+        return self
+
+
+class DurableGoalSpec(BaseModel):
+    """Provider-neutral durable execution mode."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["native", "supervised"] = "supervised"
+
+
 class NodeSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1621,6 +1787,10 @@ class NodeSpec(BaseModel):
     provider: str | ProviderConfig | None = None
     tools: ToolAccess = ToolAccess.READ_ONLY
     mcps: list[MCPServerSpec] = Field(default_factory=list)
+    connectors: list[str] = Field(default_factory=list)
+    connector_tools: dict[str, list[str]] = Field(default_factory=dict)
+    connector_bindings: list[ConnectorBindingSpec] = Field(default_factory=list, exclude=True)
+    connector_secret_env: list[str] = Field(default_factory=list, exclude=True)
     skills: list[str] = Field(default_factory=list)
     target: TargetSpec = Field(default_factory=LocalTarget)
     capture: CaptureMode = CaptureMode.FINAL
@@ -1631,15 +1801,20 @@ class NodeSpec(BaseModel):
     executable: str | None = None
     extra_args: list[str] = Field(default_factory=list)
     description: str | None = None
+    input: Any | None = None
+    output_artifact: str | None = None
+    concurrency_pool: str | None = None
+    durable_goal: DurableGoalSpec | None = None
     success_criteria: list[SuccessCriterion] = Field(default_factory=list)
     retries: int = Field(default=0, ge=0)
     retry_backoff_seconds: float = Field(default=1.0, ge=0.0)
     retry_backoff_max_seconds: float = Field(default=300.0, ge=0.0)
     retry_backoff_strategy: Literal["linear", "exponential"] = "exponential"
     schedule: PeriodicScheduleSpec | None = None
-    fanout_group: str | None = Field(default=None, exclude=True)
-    fanout_member: dict[str, Any] | None = Field(default=None, exclude=True)
-    fanout_dependencies: dict[str, list[str]] = Field(default_factory=dict, exclude=True)
+    fanout_from: RuntimeFanoutSpec | None = None
+    fanout_group: str | None = None
+    fanout_member: dict[str, Any] | None = None
+    fanout_dependencies: dict[str, list[str]] = Field(default_factory=dict)
 
     @field_validator("agent")
     @classmethod
@@ -1654,14 +1829,43 @@ class NodeSpec(BaseModel):
     @model_validator(mode="after")
     def ensure_unique_dependencies(self) -> "NodeSpec":
         self.depends_on = list(dict.fromkeys(self.depends_on))
+        self.connectors = list(dict.fromkeys(self.connectors))
+        self.connector_secret_env = list(dict.fromkeys(self.connector_secret_env))
+        normalized_connector_tools: dict[str, list[str]] = {}
+        for raw_connector, raw_tools in self.connector_tools.items():
+            connector = raw_connector.strip()
+            if not connector or connector not in self.connectors:
+                raise ValueError("`connector_tools` keys must name a connector declared on the node")
+            tools = [tool.strip() for tool in raw_tools]
+            if any(not tool for tool in tools):
+                raise ValueError("`connector_tools` entries must not be empty")
+            normalized_connector_tools[connector] = list(dict.fromkeys(tools))
+        self.connector_tools = normalized_connector_tools
         duplicate_mcp_names = sorted(name for name, count in Counter(mcp.name for mcp in self.mcps).items() if count > 1)
         if duplicate_mcp_names:
             raise ValueError(f"duplicate MCP server names on node {self.id!r}: {duplicate_mcp_names}")
         if self.schedule is not None:
-            if self.fanout_group is not None:
+            if self.fanout_group is not None or self.fanout_from is not None:
                 raise ValueError("scheduled nodes cannot also use `fanout`")
             if self.target.kind != "local":
                 raise ValueError("scheduled nodes currently require a local target")
+        if self.fanout_from is not None and self.on_failure_restart:
+            raise ValueError("runtime fan-out templates cannot be cycle tails")
+        if self.concurrency_pool is not None:
+            normalized_pool = self.concurrency_pool.strip()
+            if not normalized_pool:
+                raise ValueError("`concurrency_pool` must not be empty")
+            self.concurrency_pool = normalized_pool
+        if self.output_artifact is not None:
+            artifact = self.output_artifact.strip()
+            artifact_path = PurePosixPath(artifact)
+            if (
+                artifact in {"", "."}
+                or artifact_path.is_absolute()
+                or ".." in artifact_path.parts
+            ):
+                raise ValueError("`output_artifact` must be a safe relative artifact path")
+            self.output_artifact = artifact
         resolve_provider(self.provider, self.agent)
         return self
 
@@ -2010,6 +2214,36 @@ def _expand_fanout_node(node: dict[str, Any], fanout: FanoutSpec) -> tuple[list[
     return expanded_nodes, member_ids
 
 
+def expand_runtime_fanout_node(template: NodeSpec, values: list[Any]) -> tuple[list[NodeSpec], list[str]]:
+    """Materialize runtime fan-out members using the same context as static fan-out."""
+
+    if template.fanout_from is None:
+        raise ValueError(f"node {template.id!r} is not a runtime fan-out template")
+    if len(values) > template.fanout_from.max_items:
+        raise ValueError(
+            f"runtime fan-out {template.id!r} produced {len(values)} items, "
+            f"exceeding max_items={template.fanout_from.max_items}"
+        )
+    if not values:
+        return [], []
+
+    payload = template.model_dump(mode="python", by_alias=True)
+    payload.pop("fanout_from", None)
+    fanout = FanoutSpec(values=values, **{"as": template.fanout_from.as_})
+    expanded_payloads, member_ids = _expand_fanout_node(payload, fanout)
+    members = [NodeSpec.model_validate(item) for item in expanded_payloads]
+    for member in members:
+        if (
+            template.fanout_from.connector is None
+            and member.input is None
+            and member.fanout_member is not None
+        ):
+            member.input = deepcopy(member.fanout_member.get("value"))
+        member.connector_bindings = deepcopy(template.connector_bindings)
+        member.connector_secret_env = list(template.connector_secret_env)
+    return members, member_ids
+
+
 def _expand_fanout_dependencies(nodes: list[Any], fanouts: dict[str, list[str]]) -> list[Any]:
     expanded_nodes: list[Any] = []
     for node in nodes:
@@ -2286,6 +2520,36 @@ def apply_local_target_defaults(payload: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
+class SourceSpec(BaseModel):
+    """Repository input that AgentFlow resolves when a run starts."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    repository_url: str = Field(alias="repositoryUrl")
+    input_ref: str = Field(alias="inputRef")
+
+    @field_validator("repository_url", "input_ref")
+    @classmethod
+    def validate_source_text(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"`source_snapshot.{info.field_name}` must not be empty")
+        return normalized
+
+class SourceSnapshotSpec(SourceSpec):
+    """Resolved repository identity persisted before analysis."""
+
+    commit_sha: str = Field(alias="commitSha")
+
+    @field_validator("commit_sha")
+    @classmethod
+    def validate_commit_sha(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", normalized) is None:
+            raise ValueError("`source_snapshot.commitSha` must be a resolved 40- or 64-character SHA")
+        return normalized
+
+
 class PipelineSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2295,6 +2559,7 @@ class PipelineSpec(BaseModel):
     optimizer: str | None = None
     n_run: int = Field(default=1, ge=1)
     concurrency: int = Field(default=4, ge=1)
+    deadline_seconds: int | None = Field(default=None, gt=0)
     fail_fast: bool = False
     max_iterations: int = Field(default=10, ge=1)
     scratchboard: bool = False
@@ -2303,6 +2568,9 @@ class PipelineSpec(BaseModel):
     agent_defaults: dict[AgentKind, dict[str, Any]] = Field(default_factory=dict)
     local_target_defaults: LocalTarget | None = None
     inference: InferenceSetupSpec | None = None
+    source_snapshot: SourceSpec | None = None
+    connectors: list[ConnectorSpec] = Field(default_factory=list)
+    concurrency_pools: dict[str, int] = Field(default_factory=dict)
     fanouts: dict[str, list[str]] = Field(default_factory=dict)
     nodes: list[NodeSpec]
 
@@ -2338,6 +2606,74 @@ class PipelineSpec(BaseModel):
         duplicates = {node_id for node_id in ids if ids.count(node_id) > 1}
         if duplicates:
             raise ValueError(f"duplicate node ids: {sorted(duplicates)}")
+        connector_duplicates = sorted(
+            name for name, count in Counter(connector.name for connector in self.connectors).items() if count > 1
+        )
+        if connector_duplicates:
+            raise ValueError(f"duplicate connector names: {connector_duplicates}")
+        connector_names = {connector.name for connector in self.connectors}
+        unknown_connectors = {
+            connector_name
+            for node in self.nodes
+            for connector_name in node.connectors
+            if connector_name not in connector_names
+        }
+        if unknown_connectors:
+            raise ValueError(f"unknown connectors: {sorted(unknown_connectors)}")
+        connector_fanout_names = {
+            node.fanout_from.connector
+            for node in self.nodes
+            if node.fanout_from is not None and node.fanout_from.connector is not None
+        }
+        unknown_fanout_connectors = connector_fanout_names - connector_names
+        if unknown_fanout_connectors:
+            raise ValueError(
+                f"runtime fan-out references unknown connectors: {sorted(unknown_fanout_connectors)}"
+            )
+        connectors_without_control = sorted(
+            connector.name
+            for connector in self.connectors
+            if connector.name in connector_fanout_names and connector.control_url is None
+        )
+        if connectors_without_control:
+            raise ValueError(
+                "connector-backed runtime fan-out requires `control_url`: "
+                f"{connectors_without_control}"
+            )
+        unmanaged_fanout_connectors = sorted(
+            connector.name
+            for connector in self.connectors
+            if connector.name in connector_fanout_names and connector.command is None
+        )
+        if unmanaged_fanout_connectors:
+            raise ValueError(
+                "connector-backed runtime fan-out requires a run-scoped `command`: "
+                f"{unmanaged_fanout_connectors}"
+            )
+        normalized_pools: dict[str, int] = {}
+        for raw_name, limit in self.concurrency_pools.items():
+            name = raw_name.strip()
+            if not name:
+                raise ValueError("concurrency pool names must not be empty")
+            if limit < 1:
+                raise ValueError(f"concurrency pool {name!r} must have a positive limit")
+            normalized_pools[name] = limit
+        self.concurrency_pools = normalized_pools
+        unknown_pools = {
+            node.concurrency_pool
+            for node in self.nodes
+            if node.concurrency_pool is not None and node.concurrency_pool not in normalized_pools
+        }
+        if unknown_pools:
+            raise ValueError(f"unknown concurrency pools: {sorted(unknown_pools)}")
+        for node in self.nodes:
+            if node.fanout_from is None:
+                continue
+            source_id = node.fanout_from.from_
+            if source_id not in ids:
+                raise ValueError(f"runtime fan-out {node.id!r} references unknown source {source_id!r}")
+            if source_id not in node.depends_on:
+                node.depends_on.append(source_id)
         missing = {
             dependency
             for node in self.nodes
@@ -2426,6 +2762,7 @@ class NodeResult(BaseModel):
     exit_code: int | None = None
     final_response: str | None = None
     output: str | None = None
+    structured_output: Any | None = None
     stdout_lines: list[str] = Field(default_factory=list)
     stderr_lines: list[str] = Field(default_factory=list)
     trace_events: list[NormalizedTraceEvent] = Field(default_factory=list)
@@ -2445,12 +2782,14 @@ class RunRecord(BaseModel):
     id: str
     status: RunStatus = RunStatus.QUEUED
     pipeline: PipelineSpec
+    declared_pipeline: PipelineSpec | None = None
     optimization_parent_run_id: str | None = None
     optimization_round: int | None = Field(default=None, ge=1)
     optimization_session: dict[str, Any] | None = None
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     started_at: str | None = None
     finished_at: str | None = None
+    source_snapshot: SourceSnapshotSpec | None = None
     nodes: dict[str, NodeResult] = Field(default_factory=dict)
 
 

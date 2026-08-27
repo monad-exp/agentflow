@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from agentflow.agents.base import AgentAdapter
@@ -10,6 +11,12 @@ from agentflow.specs import NodeSpec, ProviderConfig, RepoInstructionsMode, Tool
 
 class CodexAdapter(AgentAdapter):
     _SUPPORTED_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
+    _TOML_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+    def _format_toml_key(self, value: str) -> str:
+        if self._TOML_BARE_KEY.fullmatch(value):
+            return value
+        return self._format_toml_value(value)
 
     def _format_toml_value(self, value: object) -> str:
         import json
@@ -48,9 +55,11 @@ class CodexAdapter(AgentAdapter):
                 lines.append(f"model = {self._format_toml_value(node.model)}")
             lines.append(f"model_provider = {self._format_toml_value(provider.name)}")
         if node.mcps:
+            connector_bindings = {binding.name: binding for binding in node.connector_bindings}
             for mcp in node.mcps:
                 lines.append("")
-                lines.append(f"[mcp_servers.{mcp.name}]")
+                server_key = self._format_toml_key(mcp.name)
+                lines.append(f"[mcp_servers.{server_key}]")
                 if mcp.transport == "stdio":
                     if mcp.command:
                         lines.append(f"command = {self._format_toml_value(mcp.command)}")
@@ -61,8 +70,25 @@ class CodexAdapter(AgentAdapter):
                 else:
                     if mcp.url:
                         lines.append(f"url = {self._format_toml_value(mcp.url)}")
-                    if mcp.headers:
-                        lines.append(f"http_headers = {self._format_toml_value(mcp.headers)}")
+                    headers = (
+                        connector_bindings[mcp.name].headers
+                        if mcp.name in connector_bindings
+                        else mcp.headers
+                    )
+                    if headers:
+                        lines.append(f"http_headers = {self._format_toml_value(headers)}")
+                # A connector binding is an explicit workflow-level allowlist.
+                # Trust only its declared tools so headless `codex exec` can call
+                # them without disabling the filesystem sandbox.
+                for tool in (
+                    connector_bindings[mcp.name].tools
+                    if mcp.name in connector_bindings
+                    else ()
+                ):
+                    lines.append("")
+                    tool_key = self._format_toml_key(tool.name)
+                    lines.append(f"[mcp_servers.{server_key}.tools.{tool_key}]")
+                    lines.append('approval_mode = "approve"')
         return "\n".join(lines) + "\n"
 
     def _resolve_sandbox_mode(self, node: NodeSpec, env: dict[str, str]) -> str:
@@ -136,6 +162,7 @@ class CodexAdapter(AgentAdapter):
         if repo_instructions_ignored:
             command.extend(["--disable", "plugins"])
             command.extend(["--add-dir", paths.target_workdir])
+            prompt = self.source_checkout_prompt(prompt, paths)
         command.extend(node.extra_args)
         prompt = self._maybe_prepend_wrapper(node, prompt)
         command.append(prompt)

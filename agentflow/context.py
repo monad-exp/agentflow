@@ -30,6 +30,7 @@ def _node_result_context(
     context = {
         "status": result.status.value,
         "output": result.output,
+        "data": result.structured_output,
         "final_response": result.final_response,
         "stdout": "\n".join(result.stdout_lines),
         "stderr": "\n".join(result.stderr_lines),
@@ -126,6 +127,8 @@ def _current_node_context(
         "agent": normalize_agent_name(node.agent),
         "depends_on": list(node.depends_on),
     }
+    if node.input is not None:
+        context["input"] = node.input
     if node.fanout_group:
         context["fanout_group"] = node.fanout_group
     if node.fanout_member:

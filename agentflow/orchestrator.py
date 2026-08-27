@@ -19,6 +19,8 @@ from typing import Any, Callable
 from pydantic import BaseModel, Field, ValidationError
 
 from agentflow.agents.registry import AdapterRegistry, default_adapter_registry
+from agentflow.connectors import ConnectorManager
+from agentflow.contracts import parse_json_output, select_json_path
 from agentflow.context import render_node_prompt
 from agentflow.graph_optimizer import (
     GRAPH_OPTIMIZER_MAX_ATTEMPTS,
@@ -42,7 +44,9 @@ from agentflow.runners.registry import RunnerRegistry, default_runner_registry
 from agentflow.specs import (
     AgentKind,
     NodeAttempt,
+    MCPServerSpec,
     NodeResult,
+    NodeSpec,
     NodeStatus,
     PeriodicActuationMode,
     PipelineSpec,
@@ -50,7 +54,9 @@ from agentflow.specs import (
     RunEvent,
     RunRecord,
     RunStatus,
+    SourceSnapshotSpec,
     builtin_agent_kind,
+    expand_runtime_fanout_node,
 )
 from agentflow.store import RunStore
 from agentflow.success import evaluate_success
@@ -62,9 +68,30 @@ from agentflow.utils import ensure_dir, looks_sensitive_key, redact_sensitive_sh
 _TERMINAL_NODE_STATUSES = {
     NodeStatus.COMPLETED,
     NodeStatus.FAILED,
+    NodeStatus.TIMED_OUT,
     NodeStatus.SKIPPED,
     NodeStatus.CANCELLED,
 }
+
+
+def _materialize_connector_mcps(node: Any) -> Any:
+    """Create the adapter-only MCP view of run-scoped connector bindings."""
+
+    execution = deepcopy(node)
+    servers = {mcp.name: mcp for mcp in execution.mcps}
+    for binding in execution.connector_bindings:
+        server = servers.get(binding.name)
+        if server is None:
+            execution.mcps.append(
+                MCPServerSpec(
+                    name=binding.name,
+                    transport="streamable_http",
+                    url=binding.url,
+                )
+            )
+        else:
+            server.url = binding.url
+    return execution
 
 
 class _PeriodicAction(BaseModel):
@@ -92,6 +119,7 @@ class _PeriodicNodeRuntimeState:
     next_tick_at: float | None = None
     last_tick_started_at: str | None = None
     last_tick_started_mono: float | None = None
+    waiting_for_actuation: bool = False
 
 
 @dataclass(slots=True)
@@ -113,6 +141,7 @@ class Orchestrator:
     _node_cancel_flags: dict[str, set[str]] = field(default_factory=dict, init=False, repr=False)
     _pending_node_reruns: dict[str, set[str]] = field(default_factory=dict, init=False, repr=False)
     _scratchboards: dict[str, "Scratchboard"] = field(default_factory=dict, init=False, repr=False)
+    _connector_manager: ConnectorManager = field(default_factory=ConnectorManager, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._run_slots = threading.Semaphore(self.max_concurrent_runs)
@@ -139,6 +168,7 @@ class Orchestrator:
         node_result.status = NodeStatus.PENDING
         node_result.finished_at = None
         node_result.output = None
+        node_result.structured_output = None
         node_result.exit_code = None
         node_result.success = None
         node_result.success_details = []
@@ -257,7 +287,14 @@ class Orchestrator:
         )
         await self.store.persist_run(run_id)
 
-    async def _fail_inference_setup(self, run_id: str, exc: Exception) -> RunRecord:
+    async def _fail_setup(
+        self,
+        run_id: str,
+        exc: Exception,
+        *,
+        skip_reason: str,
+        event_type: str,
+    ) -> RunRecord:
         record = self.store.get_run(run_id)
         finished_at = utcnow_iso()
         record.status = RunStatus.FAILED
@@ -266,14 +303,72 @@ class Orchestrator:
             if result.status in {NodeStatus.PENDING, NodeStatus.QUEUED, NodeStatus.READY}:
                 result.status = NodeStatus.SKIPPED
                 result.finished_at = finished_at
-                await self._publish(run_id, "node_skipped", node_id=node_id, reason="inference_setup_failed")
-        await self._publish(run_id, "inference_failed", error=str(exc))
+                await self._publish(run_id, "node_skipped", node_id=node_id, reason=skip_reason)
+        await self._publish(run_id, event_type, error=str(exc))
         await self._publish(run_id, "run_completed", status=record.status.value)
         await self.store.clear_cancel_request(run_id)
         await self.store.persist_run(run_id)
         self._node_cancel_flags.pop(run_id, None)
         self._pending_node_reruns.pop(run_id, None)
         return record
+
+    async def _prepare_connectors(self, run_id: str, record: RunRecord) -> None:
+        if not record.pipeline.connectors:
+            return
+        await self._publish(
+            run_id,
+            "connectors_starting",
+            connectors=[connector.name for connector in record.pipeline.connectors],
+        )
+        await self._connector_manager.start(
+            run_id,
+            record.pipeline,
+            self.store.run_dir(run_id),
+        )
+        await self._publish(
+            run_id,
+            "connectors_ready",
+            connectors=[connector.name for connector in record.pipeline.connectors],
+        )
+        await self.store.persist_run(run_id)
+
+    async def _prepare_source_snapshot(self, run_id: str, record: RunRecord) -> None:
+        source = record.pipeline.source_snapshot
+        if source is None:
+            return
+
+        from agentflow.worktree import create_pinned_worktree, remove_worktree, repository_root, resolve_commit
+
+        requested_workdir = record.pipeline.working_path
+        repo_dir = await asyncio.to_thread(repository_root, requested_workdir)
+        relative_workdir = requested_workdir.relative_to(repo_dir)
+        commit_sha = await asyncio.to_thread(resolve_commit, repo_dir, source.input_ref)
+        worktree_dir = await asyncio.to_thread(create_pinned_worktree, repo_dir, run_id, commit_sha)
+        try:
+            record.pipeline.working_dir = str(worktree_dir / relative_workdir)
+            record.source_snapshot = SourceSnapshotSpec(
+                repositoryUrl=source.repository_url,
+                inputRef=source.input_ref,
+                commitSha=commit_sha,
+            )
+            payload = record.source_snapshot.model_dump(mode="json", by_alias=True)
+            await self.store.write_run_artifact_json(run_id, "source-snapshot.json", payload)
+            await self._publish(run_id, "source_snapshot_persisted", source_snapshot=payload)
+            await self.store.persist_run(run_id)
+        except Exception:
+            await asyncio.to_thread(remove_worktree, repo_dir, worktree_dir)
+            raise
+
+    async def _remove_source_worktree(self, run_id: str, record: RunRecord) -> None:
+        source = record.source_snapshot
+        declared = record.declared_pipeline or record.pipeline
+        if source is None or declared.source_snapshot is None:
+            return
+        from agentflow.worktree import remove_worktree, repository_root
+
+        repo_dir = await asyncio.to_thread(repository_root, declared.working_path)
+        worktree_dir = repo_dir / ".agentflow" / "worktrees" / run_id / "source"
+        await asyncio.to_thread(remove_worktree, repo_dir, worktree_dir)
 
     def _initialize_run_tracking(self, run_id: str, *, cancel_flag: threading.Event | None = None) -> None:
         self._cancel_flags[run_id] = cancel_flag or threading.Event()
@@ -292,20 +387,32 @@ class Orchestrator:
     ) -> RunRecord:
         run_id = self.store.new_run_id()
         self._initialize_run_tracking(run_id, cancel_flag=cancel_flag)
+        declared_pipeline = pipeline.model_copy(deep=True)
+        execution_pipeline = declared_pipeline.model_copy(deep=True)
         run = RunRecord(
             id=run_id,
             status=RunStatus.QUEUED,
-            pipeline=pipeline,
+            pipeline=execution_pipeline,
+            declared_pipeline=declared_pipeline,
             optimization_parent_run_id=optimization_parent_run_id,
             optimization_round=optimization_round,
             optimization_session=deepcopy(optimization_session),
-            nodes={node.id: NodeResult(node_id=node.id, status=NodeStatus.PENDING) for node in pipeline.nodes},
+            nodes={
+                node.id: NodeResult(node_id=node.id, status=NodeStatus.PENDING)
+                for node in execution_pipeline.nodes
+            },
         )
         await self.store.create_run(run)
-        await self._publish(run_id, "run_queued", pipeline=pipeline.model_dump(mode="json"))
+        await self._publish(run_id, "run_queued", pipeline=execution_pipeline.model_dump(mode="json"))
         return run
 
     def _start_background(self, run_id: str, entrypoint: Callable[[], Any]) -> None:
+        async def _guarded_entrypoint() -> None:
+            try:
+                await entrypoint()
+            except Exception as exc:  # noqa: BLE001 - finalize the persisted run after scheduler crashes.
+                await self._fail_unhandled_run(run_id, exc)
+
         def _background() -> None:
             acquired = False
             try:
@@ -314,13 +421,47 @@ class Orchestrator:
                         asyncio.run(self._finalize_cancelled_queue_run(run_id))
                         return
                     acquired = self._run_slots.acquire(timeout=0.1)
-                asyncio.run(entrypoint())
+                asyncio.run(_guarded_entrypoint())
             finally:
                 if acquired:
                     self._run_slots.release()
                 self._run_finished[run_id].set()
 
         threading.Thread(target=_background, name=f"agentflow-{run_id}", daemon=True).start()
+
+    async def _cleanup_run_resources(self, run_id: str) -> None:
+        record = self.store.get_run(run_id)
+        if record.pipeline.connectors:
+            try:
+                await self._connector_manager.stop(run_id)
+                if not any(event.type == "connectors_stopped" for event in self.store.get_events(run_id)):
+                    await self._publish(
+                        run_id,
+                        "connectors_stopped",
+                        connectors=[connector.name for connector in record.pipeline.connectors],
+                    )
+            except Exception as exc:  # noqa: BLE001 - cleanup remains best effort.
+                await self._publish(run_id, "connectors_stop_failed", error=str(exc))
+        try:
+            await self._remove_source_worktree(run_id, record)
+        except Exception as exc:  # noqa: BLE001 - cleanup remains best effort.
+            await self._publish(run_id, "source_worktree_cleanup_failed", error=str(exc))
+
+    async def _fail_unhandled_run(self, run_id: str, exc: Exception) -> None:
+        record = self.store.get_run(run_id)
+        if record.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}:
+            return
+        finished_at = utcnow_iso()
+        record.status = RunStatus.FAILED
+        record.finished_at = finished_at
+        for result in record.nodes.values():
+            if result.status not in _TERMINAL_NODE_STATUSES:
+                result.status = NodeStatus.SKIPPED
+                result.finished_at = finished_at
+        await self._publish(run_id, "scheduler_failed", error=str(exc))
+        await self._publish(run_id, "run_completed", status=record.status.value)
+        await self.store.clear_cancel_request(run_id)
+        await self.store.persist_run(run_id)
 
     def _graph_optimization_round_dir(self, parent_run_id: str, round_number: int) -> Path:
         return ensure_dir(self.store.run_dir(parent_run_id) / "optimization" / f"round-{round_number:03d}")
@@ -442,6 +583,9 @@ class Orchestrator:
 
             try:
                 final_child = await self.run(child.id)
+            except Exception as exc:  # noqa: BLE001 - persist a terminal child before optimizing.
+                await self._fail_unhandled_run(child.id, exc)
+                final_child = self.store.get_run(child.id)
             finally:
                 self._run_finished[child.id].set()
 
@@ -671,7 +815,7 @@ class Orchestrator:
         """
 
         record = self.store.get_run(run_id)
-        return await self.submit(record.pipeline)
+        return await self.submit(record.declared_pipeline or record.pipeline)
 
     async def resume(self, run_id: str) -> RunRecord:
         """Resume a failed/cancelled run, preserving completed node results.
@@ -690,7 +834,18 @@ class Orchestrator:
                 f"Can only resume failed or cancelled runs, but run `{run_id}` has status `{old_record.status.value}`"
             )
 
-        pipeline = old_record.pipeline
+        pipeline = (old_record.declared_pipeline or old_record.pipeline).model_copy(deep=True)
+        if pipeline.source_snapshot is not None:
+            raise ValueError(
+                "resume is not supported for source-pinned runs; use rerun to resolve one fresh snapshot"
+            )
+        if any(
+            node.fanout_from is not None and node.fanout_from.connector is not None
+            for node in pipeline.nodes
+        ):
+            raise ValueError(
+                "resume is not supported for connector-backed runtime fan-out; use rerun to start a fresh run"
+            )
         new_run_id = self.store.new_run_id()
 
         # Build node results: completed nodes keep their results; others reset to pending
@@ -706,7 +861,8 @@ class Orchestrator:
         new_run = RunRecord(
             id=new_run_id,
             status=RunStatus.QUEUED,
-            pipeline=pipeline,
+            pipeline=pipeline.model_copy(deep=True),
+            declared_pipeline=pipeline.model_copy(deep=True),
             nodes=nodes,
         )
 
@@ -738,21 +894,7 @@ class Orchestrator:
         await self._publish(new_run_id, "run_queued", pipeline=pipeline.model_dump(mode="json"),
                             resumed_from=run_id)
 
-        def _background() -> None:
-            acquired = False
-            try:
-                while not acquired:
-                    if self._should_cancel(new_run_id):
-                        asyncio.run(self._finalize_cancelled_queue_run(new_run_id))
-                        return
-                    acquired = self._run_slots.acquire(timeout=0.1)
-                asyncio.run(self.run(new_run_id))
-            finally:
-                if acquired:
-                    self._run_slots.release()
-                self._run_finished[new_run_id].set()
-
-        threading.Thread(target=_background, name=f"agentflow-{new_run_id}", daemon=True).start()
+        self._start_background(new_run_id, lambda: self.run(new_run_id))
         return new_run
 
     def _should_cancel(self, run_id: str) -> bool:
@@ -1003,6 +1145,13 @@ class Orchestrator:
             current_tick_number=periodic_tick_number,
             current_tick_started_at=periodic_tick_started_at,
         )
+        contract_input = node.input
+        if contract_input is not None:
+            prompt += (
+                "\n\nAgentFlow structured input (JSON):\n```json\n"
+                + json.dumps(contract_input, ensure_ascii=False, indent=2)
+                + "\n```"
+            )
         execution_resolution = resolve_node_for_execution(node, pipeline.working_path)
         execution_node = execution_resolution.node
         runtime_agent = execution_resolution.runtime_agent
@@ -1026,6 +1175,15 @@ class Orchestrator:
                         model=execution_node.model, capture=execution_node.capture, env=execution_node.env,
                         extra_args=execution_node.extra_args, provider=execution_node.provider,
                         mcps=execution_node.mcps, skills=execution_node.skills, schedule=execution_node.schedule,
+                        connectors=execution_node.connectors,
+                        connector_tools=execution_node.connector_tools,
+                        connector_bindings=execution_node.connector_bindings,
+                        connector_secret_env=execution_node.connector_secret_env,
+                        input=execution_node.input,
+                        output_artifact=execution_node.output_artifact,
+                        concurrency_pool=execution_node.concurrency_pool,
+                        durable_goal=execution_node.durable_goal,
+                        fanout_from=execution_node.fanout_from,
                         fanout_group=execution_node.fanout_group, fanout_member=execution_node.fanout_member,
                         on_failure_restart=execution_node.on_failure_restart,
                         fanout_dependencies=getattr(execution_node, 'fanout_dependencies', {}),
@@ -1049,14 +1207,20 @@ class Orchestrator:
                 sb_path = f"{paths.target_runtime_dir}/{SCRATCHBOARD_FILENAME}"
             prompt += SCRATCHBOARD_PROMPT_SUFFIX.format(scratchboard_path=sb_path)
         adapter = self.adapters.get(runtime_agent)
+        if execution_node.durable_goal is not None and execution_node.durable_goal.mode == "native":
+            raise ValueError(
+                f"agent {runtime_agent.value!r} has no tested native durable-goal integration; use supervised mode"
+            )
         runner = self.runners.get(execution_node.target.kind)
+        adapter_node = _materialize_connector_mcps(execution_node)
         parser = create_trace_parser(runtime_agent, node.id)
         periodic_actions: _PeriodicActionEnvelope | None = None
         periodic_action_parse_error: str | None = None
 
         for attempt_number in range(1, node.retries + 2):
-            if self._should_cancel(run_id):
-                await self._mark_node_cancelled(run_id, node_id, "run_cancelled")
+            if self._should_cancel(run_id) or self._should_cancel_node(run_id, node_id):
+                reason = "run_cancelled" if self._should_cancel(run_id) else "node_cancelled"
+                await self._mark_node_cancelled(run_id, node_id, reason)
                 return _NodeExecutionOutcome(node_id=node_id, periodic_tick_number=periodic_tick_number)
 
             attempt = NodeAttempt(number=attempt_number, status=NodeStatus.RUNNING, started_at=utcnow_iso())
@@ -1065,7 +1229,17 @@ class Orchestrator:
             result.current_attempt = attempt_number
             result.attempts.append(attempt)
             parser.start_attempt(attempt_number)
-            prepared = adapter.prepare(execution_node, prompt, paths)
+            attempt_prompt = prompt
+            if (
+                execution_node.durable_goal is not None
+                and execution_node.durable_goal.mode == "supervised"
+                and attempt_number > 1
+            ):
+                attempt_prompt += (
+                    "\n\nAgentFlow supervised durable-goal resume: re-read durable connector state "
+                    "and reuse the same idempotency keys."
+                )
+            prepared = adapter.prepare(adapter_node, attempt_prompt, paths)
             # Forward local credentials to remote targets when enabled
             # EC2/ECS: always forward (ephemeral, no pre-existing config)
             # SSH: only if forward_credentials=True (remote has its own identity)
@@ -1141,6 +1315,10 @@ class Orchestrator:
             if not result.final_response and parser.supports_raw_stdout_fallback():
                 result.final_response = "\n".join(attempt_stdout_lines).strip()
             result.output = result.final_response if execution_node.capture.value == "final" else "\n".join(attempt_stdout_lines)
+            result.structured_output = None
+            structured_output, structured_error = parse_json_output(result.output or result.final_response)
+            if structured_error is None:
+                result.structured_output = structured_output
             success_ok, success_details = evaluate_success(execution_node, result, paths.host_workdir)
             result.success = success_ok
             result.success_details = success_details
@@ -1151,7 +1329,7 @@ class Orchestrator:
             attempt.success = success_ok
             attempt.success_details = success_details
 
-            if raw.cancelled or self._should_cancel(run_id):
+            if (raw.cancelled or self._should_cancel(run_id)) and not raw.timed_out:
                 attempt.status = NodeStatus.CANCELLED
                 result.status = NodeStatus.CANCELLED
                 result.finished_at = attempt.finished_at
@@ -1200,12 +1378,15 @@ class Orchestrator:
                     )
                 break
 
-            attempt.status = NodeStatus.FAILED
-            result.status = NodeStatus.FAILED
+            terminal_failure_status = (
+                NodeStatus.TIMED_OUT if raw.timed_out else NodeStatus.FAILED
+            )
+            attempt.status = terminal_failure_status
+            result.status = terminal_failure_status
             result.finished_at = attempt.finished_at
             await self._publish(
                 run_id,
-                "node_failed",
+                "node_timed_out" if raw.timed_out else "node_failed",
                 node_id=node_id,
                 attempt=attempt_number,
                 exit_code=result.exit_code,
@@ -1222,11 +1403,29 @@ class Orchestrator:
                     )
                 else:
                     delay = node.retry_backoff_seconds * attempt_number
-                await asyncio.sleep(max(delay, 0.0))
+                retry_at = asyncio.get_running_loop().time() + max(delay, 0.0)
+                while (
+                    asyncio.get_running_loop().time() < retry_at
+                    and not self._should_cancel(run_id)
+                    and not self._should_cancel_node(run_id, node_id)
+                ):
+                    await asyncio.sleep(
+                        min(0.1, retry_at - asyncio.get_running_loop().time())
+                    )
                 continue
             break
 
         await self.store.write_artifact_text(run_id, node_id, "output.txt", result.output or "")
+        if (
+            execution_node.output_artifact is not None
+            and result.status in {NodeStatus.COMPLETED, NodeStatus.READY}
+        ):
+            await self.store.write_artifact_text(
+                run_id,
+                node_id,
+                execution_node.output_artifact,
+                result.output or "",
+            )
         await self.store.write_artifact_json(run_id, node_id, "result.json", result.model_dump(mode="json"))
 
         # Merge scratchboard writes from node output
@@ -1272,7 +1471,127 @@ class Orchestrator:
             )
         return _NodeExecutionOutcome(node_id=node_id)
 
+    async def _expand_runtime_fanout(
+        self,
+        run_id: str,
+        template: NodeSpec,
+        *,
+        node_map: dict[str, NodeSpec],
+        remaining: set[str],
+    ) -> None:
+        record = self.store.get_run(run_id)
+        fanout = template.fanout_from
+        if fanout is None:  # pragma: no cover - guarded by the scheduler
+            raise ValueError(f"node {template.id!r} has no runtime fan-out specification")
+        source = record.nodes[fanout.from_]
+        if fanout.connector is not None and fanout.resource is not None:
+            structured = await self._connector_manager.fetch_collection(
+                run_id,
+                fanout.connector,
+                fanout.resource,
+            )
+        else:
+            structured = source.structured_output
+            if structured is None:
+                structured, parse_error = parse_json_output(source.output or source.final_response)
+                if parse_error is not None:
+                    raise ValueError(
+                        f"runtime fan-out {template.id!r} could not parse source "
+                        f"{fanout.from_!r}: {parse_error}"
+                    )
+                source.structured_output = structured
+        try:
+            values = select_json_path(structured, fanout.path)
+        except KeyError as exc:
+            raise ValueError(
+                f"runtime fan-out {template.id!r} path {fanout.path!r} "
+                f"was not found in source {fanout.from_!r}"
+            ) from exc
+        if not isinstance(values, list):
+            raise ValueError(
+                f"runtime fan-out {template.id!r} expected a collection at "
+                f"{fanout.path!r}, got {type(values).__name__}"
+            )
+        if fanout.connector is not None and any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            raise ValueError(
+                f"connector-backed runtime fan-out {template.id!r} must return only stable string IDs"
+            )
+        if fanout.connector is not None and len(values) != len(set(values)):
+            raise ValueError(
+                f"connector-backed runtime fan-out {template.id!r} returned duplicate stable IDs"
+            )
+
+        members, member_ids = expand_runtime_fanout_node(template, values)
+        collisions = sorted(set(member_ids) & set(node_map))
+        if collisions:
+            raise ValueError(
+                f"runtime fan-out {template.id!r} produced node ids that already exist: {collisions}"
+            )
+        record.pipeline.fanouts[template.id] = member_ids
+        template_result = record.nodes[template.id]
+        template_result.status = NodeStatus.RUNNING
+        template_result.started_at = template_result.started_at or utcnow_iso()
+        template_result.structured_output = values
+        await self._publish(
+            run_id,
+            "runtime_fanout_expanded",
+            node_id=template.id,
+            source_node_id=fanout.from_,
+            connector=fanout.connector,
+            resource=fanout.resource,
+            members=member_ids,
+        )
+        for index, member in enumerate(members):
+            if fanout.connector is not None:
+                self._connector_manager.bind_member(run_id, member, values[index])
+            record.pipeline.nodes.append(member)
+            node_map[member.id] = member
+            record.nodes[member.id] = NodeResult(node_id=member.id, status=NodeStatus.PENDING)
+            remaining.add(member.id)
+        await self.store.persist_run(run_id)
+
+    async def _settle_runtime_fanout(self, run_id: str, template: NodeSpec) -> bool:
+        record = self.store.get_run(run_id)
+        if template.id not in record.pipeline.fanouts:
+            return False
+        member_ids = record.pipeline.fanouts[template.id]
+        if any(record.nodes[member_id].status not in _TERMINAL_NODE_STATUSES for member_id in member_ids):
+            return False
+        result = record.nodes[template.id]
+        if result.status == NodeStatus.COMPLETED:
+            return True
+        result.status = NodeStatus.COMPLETED
+        result.success = True
+        result.finished_at = utcnow_iso()
+        result.output = json.dumps(
+            {
+                "members": member_ids,
+                "statuses": {member_id: record.nodes[member_id].status.value for member_id in member_ids},
+            },
+            ensure_ascii=False,
+        )
+        await self._publish(
+            run_id,
+            "runtime_fanout_settled",
+            node_id=template.id,
+            members=member_ids,
+        )
+        await self.store.write_artifact_text(run_id, template.id, "output.txt", result.output)
+        await self.store.write_artifact_json(run_id, template.id, "result.json", result.model_dump(mode="json"))
+        await self.store.persist_run(run_id)
+        return True
+
     async def run(self, run_id: str) -> RunRecord:
+        """Execute one run and always release its run-scoped resources."""
+
+        try:
+            return await self._drive_run(run_id)
+        finally:
+            await self._cleanup_run_resources(run_id)
+
+    async def _drive_run(self, run_id: str) -> RunRecord:
         """Drive a run until all nodes reach terminal outcomes.
 
         The loop skips nodes blocked by upstream failure, queues nodes whose
@@ -1286,16 +1605,50 @@ class Orchestrator:
 
         record = self.store.get_run(run_id)
         pipeline = record.pipeline
+        loop = asyncio.get_running_loop()
         record.status = RunStatus.RUNNING
         record.started_at = utcnow_iso()
         await self._publish(run_id, "run_started", pipeline=pipeline.model_dump(mode="json"))
         await self.store.persist_run(run_id)
-        if not self._should_cancel(run_id):
+        setup_steps = (
+            (
+                lambda: self._prepare_source_snapshot(run_id, record),
+                "source_setup_failed",
+                "source_snapshot_failed",
+            ),
+            (
+                lambda: self._prepare_inference_service(run_id, record),
+                "inference_setup_failed",
+                "inference_failed",
+            ),
+            (
+                lambda: self._prepare_connectors(run_id, record),
+                "connector_setup_failed",
+                "connectors_failed",
+            ),
+        )
+        for operation, skip_reason, event_type in setup_steps:
+            if self._should_cancel(run_id):
+                break
             try:
-                await self._prepare_inference_service(run_id, record)
-            except Exception as exc:  # noqa: BLE001 - fail the run before scheduling nodes.
-                return await self._fail_inference_setup(run_id, exc)
+                await operation()
+            except Exception as exc:  # noqa: BLE001 - fail before scheduling nodes.
+                return await self._fail_setup(
+                    run_id,
+                    exc,
+                    skip_reason=skip_reason,
+                    event_type=event_type,
+                )
             pipeline = record.pipeline
+
+        # Setup phases own their specific timeouts. The workflow deadline starts
+        # only after setup so an uninterruptible thread-backed Git or cloud launch
+        # is never abandoned in the background.
+        run_deadline = (
+            loop.time() + pipeline.deadline_seconds
+            if pipeline.deadline_seconds is not None
+            else None
+        )
 
         node_map = pipeline.node_map
         iteration_counts: dict[tuple[str, str], int] = {}
@@ -1315,34 +1668,78 @@ class Orchestrator:
         }
         in_progress: dict[str, asyncio.Task[_NodeExecutionOutcome]] = {}
         semaphore = asyncio.Semaphore(pipeline.concurrency)
-        loop = asyncio.get_running_loop()
         periodic_state = {
             node_id: _PeriodicNodeRuntimeState()
             for node_id, node in node_map.items()
             if node.schedule is not None
         }
+        runtime_templates = {
+            node_id: node
+            for node_id, node in node_map.items()
+            if node.fanout_from is not None
+        }
+        runtime_expanded = set(record.pipeline.fanouts) & set(runtime_templates)
+        pool_semaphores = {
+            name: asyncio.Semaphore(limit)
+            for name, limit in pipeline.concurrency_pools.items()
+        }
+        deadline_exceeded = False
 
         async def launch(node_id: str) -> _NodeExecutionOutcome:
-            async with semaphore:
-                node = node_map[node_id]
-                if node.schedule is None:
-                    return await self._execute_node(run_id, node_id)
-                state = periodic_state[node_id]
-                state.tick_count += 1
-                tick_started_at = utcnow_iso()
-                state.last_tick_started_at = tick_started_at
-                state.last_tick_started_mono = loop.time()
-                record.nodes[node_id].tick_count = state.tick_count
-                record.nodes[node_id].last_tick_started_at = tick_started_at
-                record.nodes[node_id].next_scheduled_at = None
-                return await self._execute_node(
+            node = node_map[node_id]
+
+            async def execute() -> _NodeExecutionOutcome:
+                async with semaphore:
+                    if node.schedule is None:
+                        return await self._execute_node(run_id, node_id)
+                    state = periodic_state[node_id]
+                    state.tick_count += 1
+                    tick_started_at = utcnow_iso()
+                    state.last_tick_started_at = tick_started_at
+                    state.last_tick_started_mono = loop.time()
+                    record.nodes[node_id].tick_count = state.tick_count
+                    record.nodes[node_id].last_tick_started_at = tick_started_at
+                    record.nodes[node_id].next_scheduled_at = None
+                    return await self._execute_node(
+                        run_id,
+                        node_id,
+                        periodic_tick_number=state.tick_count,
+                        periodic_tick_started_at=tick_started_at,
+                    )
+
+            pool = pool_semaphores.get(node.concurrency_pool or "")
+            if pool is None:
+                return await execute()
+            async with pool:
+                return await execute()
+
+        async def expire_deadline() -> None:
+            nonlocal deadline_exceeded
+            if deadline_exceeded:
+                return
+            deadline_exceeded = True
+            await self._publish(
+                run_id,
+                "run_deadline_exceeded",
+                deadline_seconds=pipeline.deadline_seconds,
+            )
+            for node_id in list(remaining):
+                await self._mark_node_cancelled(
                     run_id,
                     node_id,
-                    periodic_tick_number=state.tick_count,
-                    periodic_tick_started_at=tick_started_at,
+                    "run_deadline_exceeded",
                 )
+                remaining.remove(node_id)
+            self._node_cancel_flags.setdefault(run_id, set()).update(in_progress)
 
         while remaining or in_progress:
+            if (
+                run_deadline is not None
+                and loop.time() >= run_deadline
+                and not deadline_exceeded
+            ):
+                await expire_deadline()
+
             if self._should_cancel(run_id):
                 for node_id in list(remaining):
                     await self._mark_node_cancelled(run_id, node_id, "run_cancelled")
@@ -1350,7 +1747,43 @@ class Orchestrator:
                 if not in_progress:
                     break
 
-            failed_nodes = {node_id for node_id, node in record.nodes.items() if node.status == NodeStatus.FAILED}
+            for template_id, template in runtime_templates.items():
+                if template_id in runtime_expanded:
+                    await self._settle_runtime_fanout(run_id, template)
+                    continue
+                if template_id not in remaining:
+                    continue
+                if not all(record.nodes[dependency].status == NodeStatus.COMPLETED for dependency in template.depends_on):
+                    continue
+                remaining.remove(template_id)
+                try:
+                    await self._expand_runtime_fanout(
+                        run_id,
+                        template,
+                        node_map=node_map,
+                        remaining=remaining,
+                    )
+                    runtime_expanded.add(template_id)
+                    await self._settle_runtime_fanout(run_id, template)
+                except Exception as exc:  # noqa: BLE001 - surface expansion failures as node failures.
+                    result = record.nodes[template_id]
+                    result.status = NodeStatus.FAILED
+                    result.success = False
+                    result.finished_at = utcnow_iso()
+                    result.success_details = [str(exc)]
+                    await self._publish(
+                        run_id,
+                        "node_failed",
+                        node_id=template_id,
+                        error=str(exc),
+                    )
+                    await self.store.persist_run(run_id)
+
+            failed_nodes = {
+                node_id
+                for node_id, node in record.nodes.items()
+                if node.status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT}
+            }
             if pipeline.fail_fast and failed_nodes:
                 for node_id in list(remaining):
                     record.nodes[node_id].status = NodeStatus.SKIPPED
@@ -1397,7 +1830,7 @@ class Orchestrator:
                 for node_id in list(remaining)
                 if node_id not in cycle_nodes  # don't skip any node in a cycle
                 and node_id not in cycle_downstream  # don't skip nodes waiting on cycle outcome
-                and any(record.nodes[dependency].status in {NodeStatus.FAILED, NodeStatus.SKIPPED, NodeStatus.CANCELLED} for dependency in node_map[node_id].depends_on)
+                and any(record.nodes[dependency].status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT, NodeStatus.SKIPPED, NodeStatus.CANCELLED} for dependency in node_map[node_id].depends_on)
             ]
             for node_id in blocked:
                 record.nodes[node_id].status = NodeStatus.SKIPPED
@@ -1427,7 +1860,7 @@ class Orchestrator:
                 node = node_map[node_id]
                 # Cycle nodes can proceed when deps are COMPLETED or FAILED
                 if node_id in cycle_nodes or node.on_failure_restart:
-                    terminal = {NodeStatus.COMPLETED, NodeStatus.FAILED}
+                    terminal = {NodeStatus.COMPLETED, NodeStatus.FAILED, NodeStatus.TIMED_OUT}
                     if not all(record.nodes[dep].status in terminal for dep in node.depends_on):
                         continue
                 elif not all(record.nodes[dep].status == NodeStatus.COMPLETED for dep in node.depends_on):
@@ -1436,6 +1869,21 @@ class Orchestrator:
                     ready.append(node_id)
                     continue
                 state = periodic_state[node_id]
+                if state.waiting_for_actuation:
+                    continue
+                watched_members = pipeline.fanouts.get(
+                    node.schedule.until_fanout_settles_from,
+                    [],
+                )
+                if watched_members and all(
+                    record.nodes[member_id].status
+                    in {NodeStatus.PENDING, NodeStatus.READY, NodeStatus.QUEUED}
+                    for member_id in watched_members
+                ):
+                    # A controller cannot observe useful state before any watched
+                    # member has started. Let workers launch first so tick 1 has a
+                    # stable view of their logs and lifecycle state.
+                    continue
                 if state.next_tick_at is None or now >= state.next_tick_at:
                     ready.append(node_id)
             for node_id in ready:
@@ -1444,13 +1892,48 @@ class Orchestrator:
                     record.nodes[node_id].status = NodeStatus.QUEUED
                     in_progress[node_id] = asyncio.create_task(launch(node_id))
             if in_progress:
-                done, _ = await asyncio.wait(in_progress.values(), timeout=0.1, return_when=asyncio.FIRST_COMPLETED)
+                wait_timeout = 0.1
+                if run_deadline is not None and not deadline_exceeded:
+                    wait_timeout = max(0.0, min(wait_timeout, run_deadline - loop.time()))
+                done, _ = await asyncio.wait(
+                    in_progress.values(),
+                    timeout=wait_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if (
+                    run_deadline is not None
+                    and loop.time() >= run_deadline
+                    and not deadline_exceeded
+                ):
+                    await expire_deadline()
                 finished_ids = [node_id for node_id, task in in_progress.items() if task in done]
                 for node_id in finished_ids:
                     task = in_progress.pop(node_id)
-                    outcome = await task
                     node = node_map[node_id]
                     self._node_cancel_flags.setdefault(run_id, set()).discard(node_id)
+                    try:
+                        outcome = await task
+                    except Exception as exc:  # noqa: BLE001 - keep scheduling and connector cleanup alive.
+                        node_result = record.nodes[node_id]
+                        node_result.status = NodeStatus.FAILED
+                        node_result.success = False
+                        node_result.finished_at = utcnow_iso()
+                        node_result.success_details = [f"node execution crashed: {exc}"]
+                        if node_result.attempts and node_result.attempts[-1].status == NodeStatus.RUNNING:
+                            node_result.attempts[-1].status = NodeStatus.FAILED
+                            node_result.attempts[-1].finished_at = node_result.finished_at
+                            node_result.attempts[-1].success = False
+                            node_result.attempts[-1].success_details = list(node_result.success_details)
+                        await self._publish(
+                            run_id,
+                            "node_failed",
+                            node_id=node_id,
+                            error=str(exc),
+                            success=False,
+                            success_details=node_result.success_details,
+                        )
+                        await self.store.persist_run(run_id)
+                        continue
 
                     if node.schedule is not None:
                         if outcome.periodic_actions is not None:
@@ -1484,9 +1967,18 @@ class Orchestrator:
                                 remaining=remaining,
                                 in_progress=in_progress,
                             )
+                            if any(
+                                action.kind in {"cancel", "rerun"} and action.node_ids
+                                for action in outcome.periodic_actions.actions
+                            ):
+                                periodic_state[node_id].waiting_for_actuation = True
 
                         node_result = record.nodes[node_id]
-                        if node_result.status == NodeStatus.READY and not self._should_cancel(run_id):
+                        if (
+                            node_result.status == NodeStatus.READY
+                            and not self._should_cancel(run_id)
+                            and not deadline_exceeded
+                        ):
                             if self._fanout_group_settled(
                                 pipeline,
                                 record.nodes,
@@ -1514,9 +2006,10 @@ class Orchestrator:
 
                     # -- on_failure_restart: cycle back-edge handling --
                     if (
-                        record.nodes[node_id].status == NodeStatus.FAILED
+                        record.nodes[node_id].status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT}
                         and node.on_failure_restart
                         and not self._should_cancel(run_id)
+                        and not deadline_exceeded
                     ):
                         iteration_key = (run_id, node_id)
                         iteration_counts[iteration_key] = iteration_counts.get(iteration_key, 0) + 1
@@ -1559,6 +2052,7 @@ class Orchestrator:
                         node_id in self._pending_node_reruns.setdefault(run_id, set())
                         and record.nodes[node_id].status in _TERMINAL_NODE_STATUSES
                         and not self._should_cancel(run_id)
+                        and not deadline_exceeded
                     ):
                         self._pending_node_reruns[run_id].discard(node_id)
                         record.nodes[node_id].status = NodeStatus.PENDING
@@ -1567,14 +2061,28 @@ class Orchestrator:
                         remaining.add(node_id)
                         await self._publish(run_id, "node_rerun_queued", node_id=node_id)
                         await self.store.persist_run(run_id)
+                for template_id in runtime_expanded:
+                    await self._settle_runtime_fanout(run_id, runtime_templates[template_id])
             elif remaining:
                 await asyncio.sleep(0.05)
             else:
                 break
 
-        if record.status == RunStatus.CANCELLING or self._should_cancel(run_id):
+        if (
+            run_deadline is not None
+            and loop.time() >= run_deadline
+            and not deadline_exceeded
+        ):
+            await expire_deadline()
+
+        if deadline_exceeded:
+            record.status = RunStatus.FAILED
+        elif record.status == RunStatus.CANCELLING or self._should_cancel(run_id):
             record.status = RunStatus.CANCELLED
-        elif any(node.status == NodeStatus.FAILED for node in record.nodes.values()):
+        elif any(
+            node.status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT}
+            for node in record.nodes.values()
+        ):
             record.status = RunStatus.FAILED
         else:
             record.status = RunStatus.COMPLETED

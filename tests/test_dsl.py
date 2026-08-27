@@ -126,7 +126,7 @@ def test_merge_rejects_neither_by_nor_size():
 
 
 def test_airflow_like_dag_builds_dependencies():
-    with Graph("demo", working_dir="/tmp/work", concurrency=2) as dag:
+    with Graph("demo", working_dir="/tmp/work", concurrency=2, deadline_seconds=3600) as dag:
         plan = codex(task_id="plan", prompt="plan")
         implement = claude(task_id="implement", prompt="implement")
         review = kimi(task_id="review", prompt="review")
@@ -139,6 +139,7 @@ def test_airflow_like_dag_builds_dependencies():
 
     assert spec.name == "demo"
     assert spec.working_dir == "/tmp/work"
+    assert spec.deadline_seconds == 3600
     assert nodes["implement"].depends_on == ["plan"]
     assert nodes["review"].depends_on == ["plan"]
     assert set(nodes["merge"].depends_on) == {"implement", "review"}

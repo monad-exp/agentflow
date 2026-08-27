@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 
 from agentflow.prepared import ExecutionPaths, PreparedExecution
@@ -12,9 +13,24 @@ class PythonAdapter:
     """Run a Python script. The prompt is the Python code."""
 
     def prepare(self, node: NodeSpec, prompt: str, paths: ExecutionPaths) -> PreparedExecution:
+        env = dict(node.env or {})
+        if node.connector_bindings:
+            env["AGENTFLOW_CONNECTOR_URLS"] = json.dumps(
+                {binding.name: binding.url for binding in node.connector_bindings},
+                ensure_ascii=False,
+            )
+            env["AGENTFLOW_CONNECTOR_HEADERS"] = json.dumps(
+                {binding.name: binding.headers for binding in node.connector_bindings},
+                ensure_ascii=False,
+            )
         return PreparedExecution(
-            command=["python3", "-c", prompt],
-            env=dict(node.env or {}),
+            command=[
+                "python3",
+                *(["-I"] if node.connector_bindings else []),
+                "-c",
+                prompt,
+            ],
+            env=env,
             cwd=paths.target_workdir,
             trace_kind="python",
             runtime_files={},

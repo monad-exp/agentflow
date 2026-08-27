@@ -55,6 +55,9 @@ class RunStore:
     def node_artifact_dir(self, run_id: str, node_id: str) -> Path:
         return ensure_dir(self.run_dir(run_id) / "artifacts" / node_id)
 
+    def run_artifact_dir(self, run_id: str) -> Path:
+        return ensure_dir(self.run_dir(run_id) / "artifacts" / "_run")
+
     def artifact_path(self, run_id: str, node_id: str, name: str) -> Path:
         return self.node_artifact_dir(run_id, node_id) / name
 
@@ -66,7 +69,10 @@ class RunStore:
         run_dir = self.run_dir(run_id)
         lock = self._locks[run_id]
         with lock:
-            (run_dir / "run.json").write_text(record.model_dump_json(indent=2), encoding="utf-8")
+            (run_dir / "run.json").write_text(
+                record.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
 
     async def append_event(self, run_id: str, event: RunEvent) -> None:
         lock = self._locks[run_id]
@@ -94,6 +100,7 @@ class RunStore:
 
     async def append_artifact_text(self, run_id: str, node_id: str, name: str, content: str) -> None:
         path = self.artifact_path(run_id, node_id, name)
+        ensure_dir(path.parent)
         lock = self._locks[run_id]
         with lock:
             with path.open("a", encoding="utf-8") as handle:
@@ -101,12 +108,19 @@ class RunStore:
 
     async def write_artifact_text(self, run_id: str, node_id: str, name: str, content: str) -> None:
         path = self.artifact_path(run_id, node_id, name)
+        ensure_dir(path.parent)
         lock = self._locks[run_id]
         with lock:
             path.write_text(content, encoding="utf-8")
 
     async def write_artifact_json(self, run_id: str, node_id: str, name: str, payload: object) -> None:
         await self.write_artifact_text(run_id, node_id, name, json.dumps(payload, ensure_ascii=False, indent=2))
+
+    async def write_run_artifact_json(self, run_id: str, name: str, payload: object) -> None:
+        path = self.run_artifact_dir(run_id) / name
+        lock = self._locks[run_id]
+        with lock:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def read_artifact_text(self, run_id: str, node_id: str, name: str) -> str:
         return self.artifact_path(run_id, node_id, name).read_text(encoding="utf-8")

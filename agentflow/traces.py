@@ -58,6 +58,30 @@ class BaseTraceParser:
             raw=raw,
         )
 
+    def emit_connector_completed(
+        self,
+        *,
+        tool_name: str,
+        call_id: str | None,
+        is_error: bool,
+        raw: Any,
+        connector: str | None = None,
+        tool: str | None = None,
+    ) -> NormalizedTraceEvent:
+        return NormalizedTraceEvent(
+            node_id=self.node_id,
+            agent=self.agent,
+            attempt=self.attempt,
+            kind="connector_tool_completed",
+            title=f"Connector tool completed: {tool_name}",
+            raw=raw,
+            connector=connector,
+            tool=tool,
+            tool_name=tool_name,
+            call_id=call_id,
+            is_error=is_error,
+        )
+
     def start_attempt(self, attempt: int) -> None:
         self.attempt = attempt
         self.final_chunks.clear()
@@ -124,7 +148,27 @@ class CodexTraceParser(BaseTraceParser):
             item_type = item.get("type") or item.get("details", {}).get("type") or "item"
             if item_type in {"agentMessage", "agent_message"} and text:
                 self.remember(text)
-            events.append(self.emit("item_completed", f"Item completed: {item_type}", text, payload))
+            if item_type == "mcp_tool_call":
+                connector = item.get("server")
+                tool = item.get("tool")
+                status = item.get("status")
+                error = item.get("error")
+                events.append(
+                    self.emit_connector_completed(
+                        connector=connector if isinstance(connector, str) else None,
+                        tool=tool if isinstance(tool, str) else None,
+                        tool_name=(
+                            f"{connector}.{tool}"
+                            if isinstance(connector, str) and isinstance(tool, str)
+                            else str(item.get("name") or "mcp_tool_call")
+                        ),
+                        call_id=str(item["id"]) if item.get("id") is not None else None,
+                        is_error=status != "completed" or (error is not None and error != ""),
+                        raw=payload,
+                    )
+                )
+            else:
+                events.append(self.emit("item_completed", f"Item completed: {item_type}", text, payload))
         elif event_type in {"item.started", "item/started"}:
             item = payload.get("item") or payload.get("params", {}).get("item") or {}
             item_type = item.get("type") or item.get("details", {}).get("type") or "item"
@@ -144,8 +188,21 @@ class CodexTraceParser(BaseTraceParser):
 
 @dataclass(slots=True)
 class ClaudeTraceParser(BaseTraceParser):
+    connector_calls: dict[str, str] = field(default_factory=dict)
+
     def supports_raw_stdout_fallback(self) -> bool:
         return False
+
+    def start_attempt(self, attempt: int) -> None:
+        BaseTraceParser.start_attempt(self, attempt)
+        self.connector_calls.clear()
+
+    @staticmethod
+    def _connector_name(tool_name: str) -> tuple[str | None, str | None]:
+        if not tool_name.startswith("mcp__"):
+            return None, None
+        parts = tool_name.split("__", 2)
+        return (parts[1], parts[2]) if len(parts) == 3 else (None, None)
 
     def feed(self, line: str) -> list[NormalizedTraceEvent]:
         payload = _json(line)
@@ -166,9 +223,20 @@ class ClaudeTraceParser(BaseTraceParser):
         text = _stringify(payload.get("message") or payload.get("result") or payload.get("delta") or payload.get("content"))
         events: list[NormalizedTraceEvent] = []
 
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+
         if event_type in {"assistant", "message"}:
             self.remember(text)
             events.append(self.emit("assistant_message", "Assistant message", text, payload))
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    call_id = block.get("id")
+                    tool_name = block.get("name")
+                    if isinstance(call_id, str) and isinstance(tool_name, str):
+                        self.connector_calls[call_id] = tool_name
         elif event_type in {"result", "final"}:
             if text and text != self.last_message:
                 self.remember(text)
@@ -176,6 +244,25 @@ class ClaudeTraceParser(BaseTraceParser):
         elif event_type in {"tool_use", "tool_result"}:
             title = f"{event_type.replace('_', ' ').title()}"
             events.append(self.emit(event_type, title, text, payload))
+        elif event_type == "user" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                call_id = block.get("tool_use_id")
+                tool_name = self.connector_calls.get(call_id) if isinstance(call_id, str) else None
+                if tool_name is None:
+                    continue
+                connector, tool = self._connector_name(tool_name)
+                events.append(
+                    self.emit_connector_completed(
+                        connector=connector,
+                        tool=tool,
+                        tool_name=tool_name,
+                        call_id=call_id,
+                        is_error=bool(block.get("is_error", False)),
+                        raw=payload,
+                    )
+                )
         else:
             events.append(self.emit("event", str(event_type), text, payload))
         return events
@@ -333,6 +420,23 @@ class PiTraceParser(BaseTraceParser):
             message = payload.get("message") or {}
             text = self._extract_text_from_content(message.get("content"))
             events.append(self.emit("turn_end", "Turn end", text, payload))
+            return events
+
+        if event_type == "tool_execution_end":
+            tool_name = payload.get("toolName")
+            if isinstance(tool_name, str):
+                events.append(
+                    self.emit_connector_completed(
+                        tool_name=tool_name,
+                        call_id=(
+                            str(payload["toolCallId"])
+                            if payload.get("toolCallId") is not None
+                            else None
+                        ),
+                        is_error=payload.get("isError") is not False,
+                        raw=payload,
+                    )
+                )
             return events
 
         if event_type in {"session", "agent_start", "turn_start", "message_start"}:

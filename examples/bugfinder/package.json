@@ -1,0 +1,35 @@
+{
+  "name": "agentflow-bugfinder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "overrides": {
+    "@hono/node-server": "1.19.15"
+  },
+  "scripts": {
+    "prebuild": "npm run prisma:generate",
+    "build": "tsc --noEmit",
+    "connector": "tsx src/server.ts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy",
+    "pretest": "npm run prisma:generate",
+    "test": "vitest run",
+    "test:integration": "vitest run test/bugdb.integration.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@prisma/client": "6.12.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.3",
+    "@types/node": "22.18.1",
+    "prisma": "6.12.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2",
+    "vitest": "4.1.11"
+  }
+}

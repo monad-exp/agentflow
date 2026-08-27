@@ -30,7 +30,7 @@ with DAG("demo", working_dir=".", concurrency=3) as dag:
 spec = dag.to_spec()
 ```
 
-Use `fanout(node, source)` to fan a node into parallel copies and `merge(node, source, by=...|size=...)` to reduce them.
+Use `fanout(node, source)` for static copies, `fanout_from(node, source, path=...)` for a collection produced at run time, and `merge(node, source, by=...|size=...)` to reduce static fan-outs.
 `DAG(...)` also accepts `fail_fast`, `node_defaults`, `agent_defaults`, and `local_target_defaults`.
 Use `dag.to_json()` to serialize a compact runnable pipeline, `dag.to_payload()` for the raw object structure, and `dag.to_spec()` for the fully expanded in-memory pipeline object.
 
@@ -42,24 +42,35 @@ Each node supports:
 
 - `agent`: `codex`, `claude`, `kimi`, or `pi`; utility nodes also use `python`, `shell`, and `sync`
 - `fanout`: `count`, `values`, `matrix`, `group_by`, or `batches`, plus optional `as`, `derive`, and matrix-only `include` / `exclude`
+- `fanout_from`: run-time collection source with `from`, `path`, `as`, and `max_items`; add `connector` and `resource` for durable connector-backed IDs
 - `schedule`: optional periodic execution for local nodes with `every_seconds`, `until_fanout_settles_from`, and optional `actuation`
 - `model`: any model string understood by the backend
 - `provider`: a string or a structured provider config with `base_url`, `api_key_env`, headers, and env
 - `tools`: `read_only` or `read_write`
 - `repo_instructions_mode`: `inherit` (default) or `ignore` for agent CLIs that should not absorb repo-local instruction files such as `AGENTS.md`, `CLAUDE.md`, or project skills
 - `mcps`: a list of MCP server definitions
+- `connectors`: names of top-level run-scoped connectors to inject
+- `connector_tools`: optional connector-to-tool allowlists for this node
+- `input`: optional structured JSON supplied to the node
+- `output_artifact`: additional relative artifact path for the final response, such as `report.md`
+- `concurrency_pool`: a named top-level provider concurrency limit
+- `durable_goal`: `supervised` connector-state retry or reserved `native` execution
 - `skills`: a list of local skill paths or names
 - `target`: `local`, `docker`, `container`, `ssh`, `ec2`, or `ecs`
 - local target fields: `cwd`, `bootstrap`, `shell`, `shell_login`, `shell_interactive`, and `shell_init`
 - `capture`: `final` or `trace`
 - `retries` and `retry_backoff_seconds`
-- `success_criteria`: output or filesystem checks evaluated after execution
+- `success_criteria`: output, filesystem, or completed connector-tool checks evaluated after execution (`connector_tool_called` prevents a polite final response from substituting for a required durable write)
 
 Skill entries are resolved from the pipeline `working_dir`. You can point `skills:` at a plain file, a `.md` file, a home-relative path such as `~/.codex/skills/release-skill`, or a directory that contains `SKILL.md`.
 
 Top-level pipeline controls include:
 
 - `concurrency`: max parallel nodes within a run
+- `deadline_seconds`: optional wall-clock limit for scheduling and node execution after setup
+- `concurrency_pools`: independent named limits shared by selected nodes
+- `connectors`: run-scoped streamable-HTTP tool services, with optional process lifecycle and explicit environment injection
+- `source_snapshot`: `repositoryUrl` and `inputRef` resolved and pinned when the run starts
 - `fail_fast`: skip downstream work after the first failed node
 - `node_defaults`: shared node fields merged into every node before validation
 - `agent_defaults`: agent-specific shared node fields keyed by `codex`, `claude`, or `kimi`
@@ -117,6 +128,104 @@ with DAG("sweep-demo", concurrency=8) as dag:
         prompt="{% for s in fanouts.review.nodes %}{{ s.output }}\n{% endfor %}",
     )
     review >> final
+```
+
+### Runtime fan-out
+
+`fanout_from()` reads a JSON collection from a completed source node and
+materializes one member per value. `path` accepts a dotted path such as
+`targets` or a JSON Pointer such as `/payload/targets`. The source must emit
+valid JSON, and `max_items` bounds accidental expansion.
+
+```python
+from agentflow import DAG, codex, fanout_from
+
+with DAG("dynamic-sweep", concurrency=16) as dag:
+    plan = codex(
+        task_id="plan",
+        prompt="Return JSON with a targets array.",
+    )
+    worker = fanout_from(
+        codex(
+            task_id="worker",
+            prompt="Process the AgentFlow structured input.",
+        ),
+        plan,
+        path="targets",
+        max_items=1000,
+    )
+```
+
+Each member receives its value as structured input and as `item.value`. The
+template node settles only after every member is terminal, including failures,
+so a downstream node can implement mandatory review or cleanup. Member results
+remain available under `fanouts.<template>.nodes`.
+
+For a durable inter-stage handoff, set `connector` and `resource`. The source
+node remains the scheduling dependency, but its stdout is not parsed. AgentFlow
+queries the connector control endpoint for stable string IDs and injects a
+signed item scope into each member's connector binding. The member receives no
+structured domain payload:
+
+```python
+hunt = fanout_from(
+    codex(task_id="hunt", prompt="Call bugdb.get_hunt.", connectors=["bugdb"]),
+    planning,
+    connector="bugdb",
+    resource="hunts",
+)
+```
+
+### Run-scoped connectors
+
+Top-level `connectors` describe a streamable-HTTP tool service. `command` and
+`args` make the process run-scoped; omit them to bind an already-running
+service. `env` provides literal values and `env_from` maps connector variable
+names to host variable names. AgentFlow starts each service once, waits for its
+URL, injects selected connectors into nodes, and stops it after the run.
+
+`control_url` enables connector-backed runtime fan-out. AgentFlow gives a
+managed connector a per-run control token and item-signing secret. Control
+tokens and signed item bindings are excluded from persisted pipeline state;
+agents cannot choose another Hunt/Finding ID through tool arguments.
+
+Codex and Claude receive connectors as MCP servers. Pi receives a generated
+extension exposing the same namespaced logical tools. AgentFlow uses declared
+tool metadata (`name`, `description`, and `input_schema`), or schemas discovered
+from a managed connector, for the Pi bridge.
+Connector credential names are stripped from local agent subprocesses. Set
+`connector_tools={"bugdb": ["get_hunt", "add_lead"]}` on a node to expose only
+those tools. Omit the entry to expose all declared tools for that connector.
+
+### Source snapshots and durable goals
+
+AgentFlow resolves `source_snapshot.inputRef` in the configured `working_dir`
+when the run starts. It persists `repositoryUrl`, `inputRef`, and the resolved
+commit in the run record and `artifacts/_run/source-snapshot.json`. It then runs
+local nodes from one detached, run-scoped worktree. Resolution and worktree
+creation finish before inference services, connectors, or nodes start.
+Source-pinned runs use `rerun`, not `resume`, so completed work is never mixed
+across commits.
+
+`durable_goal={"mode": "supervised"}` uses ordinary AgentFlow retries as
+provider-neutral resume: the next attempt re-reads connector state and reuses
+idempotency keys. Built-in adapters reject `mode="native"` until an adapter has
+a tested native durable-goal lifecycle; AgentFlow does not simulate it with a
+prompt prefix.
+
+Named `concurrency_pools` cap shared providers without reducing unrelated work:
+
+```python
+with DAG(
+    "pooled",
+    concurrency=32,
+    concurrency_pools={"codex-provider": 8, "openrouter": 12},
+) as dag:
+    codex(
+        task_id="review",
+        prompt="Review the input.",
+        concurrency_pool="codex-provider",
+    )
 ```
 
 ### `item` shape (fanout)

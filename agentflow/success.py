@@ -7,11 +7,37 @@ from agentflow.specs import (
     FileContainsCriterion,
     FileExistsCriterion,
     FileNonEmptyCriterion,
+    ConnectorToolCalledCriterion,
     NodeResult,
     NodeSpec,
     OutputContainsCriterion,
     OutputRegexCriterion,
 )
+
+
+def _connector_tool_completed(result: NodeResult, connector: str, tool: str) -> bool:
+    aliases = {
+        f"{connector}.{tool}",
+        f"{connector}_{tool}",
+        f"mcp__{connector}__{tool}",
+    }
+    attempt = result.current_attempt or max(
+        (event.attempt for event in result.trace_events),
+        default=1,
+    )
+    return any(
+        event.attempt == attempt
+        and event.kind == "connector_tool_completed"
+        and getattr(event, "is_error", True) is False
+        and (
+            (
+                getattr(event, "connector", None) == connector
+                and getattr(event, "tool", None) == tool
+            )
+            or getattr(event, "tool_name", None) in aliases
+        )
+        for event in result.trace_events
+    )
 
 
 def _read_success_text(path: Path) -> str | None:
@@ -75,6 +101,11 @@ def evaluate_success(node: NodeSpec, result: NodeResult, working_dir: Path) -> t
             path = working_dir / criterion.path
             ok = path.exists() and _has_nonempty_contents(path)
             messages.append(f"file_nonempty({criterion.path})={ok}")
+        elif isinstance(criterion, ConnectorToolCalledCriterion):
+            ok = _connector_tool_completed(result, criterion.connector, criterion.tool)
+            messages.append(
+                f"connector_tool_called({criterion.connector}.{criterion.tool})={ok}"
+            )
         else:
             ok = False
             messages.append(f"unsupported success criterion: {criterion}")

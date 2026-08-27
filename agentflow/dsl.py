@@ -128,6 +128,7 @@ class Graph:
         optimizer: str | None = None,
         n_run: int = 1,
         concurrency: int = 4,
+        deadline_seconds: int | None = None,
         fail_fast: bool = False,
         max_iterations: int = 10,
         scratchboard: bool = False,
@@ -136,6 +137,9 @@ class Graph:
         agent_defaults: dict[str | AgentKind, dict[str, Any]] | None = None,
         local_target_defaults: dict[str, Any] | LocalTarget | None = None,
         inference: InferenceSetup | dict[str, Any] | None = None,
+        source_snapshot: dict[str, str] | None = None,
+        connectors: list[dict[str, Any]] | None = None,
+        concurrency_pools: dict[str, int] | None = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -143,6 +147,7 @@ class Graph:
         self.optimizer = optimizer
         self.n_run = n_run
         self.concurrency = concurrency
+        self.deadline_seconds = deadline_seconds
         self.fail_fast = fail_fast
         self.max_iterations = max_iterations
         self.scratchboard = scratchboard
@@ -151,6 +156,9 @@ class Graph:
         self.agent_defaults = agent_defaults
         self.local_target_defaults = local_target_defaults
         self.inference = inference
+        self.source_snapshot = source_snapshot
+        self.connectors = connectors
+        self.concurrency_pools = concurrency_pools
         self._nodes: dict[str, NodeBuilder] = {}
         self._token: Token[Graph | None] | None = None
 
@@ -186,6 +194,8 @@ class Graph:
             payload["optimizer"] = self.optimizer
         payload["n_run"] = self.n_run
         payload["concurrency"] = self.concurrency
+        if self.deadline_seconds is not None:
+            payload["deadline_seconds"] = self.deadline_seconds
         payload["fail_fast"] = self.fail_fast
         payload["max_iterations"] = self.max_iterations
         payload["scratchboard"] = self.scratchboard
@@ -198,6 +208,12 @@ class Graph:
             payload["local_target_defaults"] = self.local_target_defaults
         if self.inference is not None:
             payload["inference"] = _normalize_inference_setup(self.inference)
+        if self.source_snapshot is not None:
+            payload["source_snapshot"] = deepcopy(self.source_snapshot)
+        if self.connectors is not None:
+            payload["connectors"] = deepcopy(self.connectors)
+        if self.concurrency_pools is not None:
+            payload["concurrency_pools"] = dict(self.concurrency_pools)
         payload["nodes"] = [node.to_payload() for node in self._nodes.values()]
         return payload
 
@@ -323,6 +339,33 @@ def fanout(
     if exclude is not None:
         payload["exclude"] = deepcopy(exclude)
     node.kwargs["fanout"] = payload
+    return node
+
+
+def fanout_from(
+    node: NodeBuilder,
+    source: NodeBuilder,
+    *,
+    path: str = "$",
+    as_: str = "item",
+    max_items: int = 1000,
+    connector: str | None = None,
+    resource: str | None = None,
+) -> NodeBuilder:
+    """Fan out from source JSON or a durable connector collection after source completes."""
+
+    node.kwargs["fanout_from"] = {
+        "from": source.id,
+        "path": path,
+        "as": as_,
+        "max_items": max_items,
+    }
+    if connector is not None or resource is not None:
+        node.kwargs["fanout_from"].update(
+            {"connector": connector, "resource": resource}
+        )
+    if source.id not in node.depends_on:
+        node.depends_on.append(source.id)
     return node
 
 

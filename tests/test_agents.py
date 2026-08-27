@@ -144,6 +144,43 @@ def test_codex_adapter_uses_runtime_codex_home_for_mcp_config(tmp_path):
     assert 'command = "npx"' in prepared.runtime_files["codex_home/config.toml"]
 
 
+def test_codex_adapter_approves_only_declared_connector_tools(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "persist",
+            "agent": "codex",
+            "prompt": "persist",
+            "mcps": [
+                {
+                    "name": "bugdb",
+                    "transport": "streamable_http",
+                    "url": "http://127.0.0.1:4312/mcp",
+                }
+            ],
+            "connector_bindings": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:4312/mcp",
+                    "tools": [
+                        {
+                            "name": "add_hunts",
+                            "description": "Append Hunts",
+                            "input_schema": {"type": "object"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    prepared = CodexAdapter().prepare(node, node.prompt, _paths(tmp_path))
+    config = prepared.runtime_files["codex_home/config.toml"]
+
+    assert "[mcp_servers.bugdb.tools.add_hunts]" in config
+    assert 'approval_mode = "approve"' in config
+    assert "dangerously" not in " ".join(prepared.command)
+
+
 def test_codex_adapter_isolates_home_when_runtime_codex_home_is_used(tmp_path):
     node = NodeSpec.model_validate(
         {
@@ -189,6 +226,7 @@ def test_codex_adapter_can_ignore_repo_instructions_with_isolated_runtime_cwd(tm
     assert "--add-dir" in prepared.command
     add_dir_index = prepared.command.index("--add-dir")
     assert prepared.command[add_dir_index + 1] == str(tmp_path)
+    assert f"AgentFlow pinned source checkout: {json.dumps(str(tmp_path))}" in prepared.command[-1]
 
 
 def test_claude_adapter_uses_tools_flag_for_read_only_access(tmp_path):
@@ -224,6 +262,42 @@ def test_claude_adapter_uses_tools_flag_for_read_write_access(tmp_path):
     assert "Write" in prepared.command[index + 1].split(",")
 
 
+def test_claude_adapter_allows_declared_connector_tools(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "persist",
+            "agent": "claude",
+            "prompt": "Persist",
+            "mcps": [
+                {
+                    "name": "bugdb",
+                    "transport": "streamable_http",
+                    "url": "http://127.0.0.1:4312/mcp",
+                }
+            ],
+            "connector_bindings": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:4312/mcp",
+                    "tools": [
+                        {
+                            "name": "add_hunts",
+                            "description": "Append Hunts",
+                            "input_schema": {"type": "object"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    prepared = ClaudeAdapter().prepare(node, "Persist", _paths(tmp_path))
+    tools_index = prepared.command.index("--tools")
+
+    assert "mcp__bugdb__add_hunts" in prepared.command[tools_index + 1].split(",")
+    assert "--mcp-config" in prepared.command
+
+
 def test_claude_adapter_can_ignore_repo_instructions_with_bare_runtime_cwd(tmp_path):
     node = NodeSpec.model_validate(
         {
@@ -241,6 +315,8 @@ def test_claude_adapter_can_ignore_repo_instructions_with_bare_runtime_cwd(tmp_p
     add_dir_index = prepared.command.index("--add-dir")
     assert prepared.command[add_dir_index + 1] == str(tmp_path)
     assert prepared.cwd == str(tmp_path / ".runtime")
+    prompt_index = prepared.command.index("-p") + 1
+    assert f"AgentFlow pinned source checkout: {json.dumps(str(tmp_path))}" in prepared.command[prompt_index]
 
 
 def test_claude_adapter_supports_kimi_provider_alias(tmp_path, monkeypatch):
@@ -581,8 +657,9 @@ def test_pi_adapter_honors_repo_instructions_ignore(tmp_path):
     assert "--no-skills" in prepared.command
     assert "--no-extensions" in prepared.command
     assert "--no-prompt-templates" in prepared.command
-    # cwd moves out of the project workdir to avoid picking up AGENTS.md.
-    assert prepared.cwd == str(tmp_path / ".runtime")
+    assert "--no-context-files" in prepared.command
+    assert prepared.cwd == str(tmp_path)
+    assert f"AgentFlow pinned source checkout: {json.dumps(str(tmp_path))}" in (prepared.stdin or "")
 
 
 def test_pi_adapter_rejects_mcp_servers(tmp_path):
@@ -596,6 +673,48 @@ def test_pi_adapter_rejects_mcp_servers(tmp_path):
     )
     with pytest.raises(ValueError, match="pi adapter does not support `mcps`"):
         PiAdapter().prepare(node, "Scan", _paths(tmp_path))
+
+
+def test_pi_adapter_bridges_run_scoped_connector_tools_with_an_extension(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "scan",
+            "agent": "pi",
+            "prompt": "Scan",
+            "repo_instructions_mode": "ignore",
+            "mcps": [{"name": "bugdb", "transport": "streamable_http", "url": "http://127.0.0.1:4312/mcp"}],
+            "connector_bindings": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:4312/mcp",
+                    "tools": [
+                        {
+                            "name": "add_lead",
+                            "description": "Append one immutable Lead",
+                            "input_schema": {
+                                "type": "object",
+                                "required": ["callerKey"],
+                                "properties": {"callerKey": {"type": "string"}},
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    prepared = PiAdapter().prepare(node, "Scan", _paths(tmp_path))
+
+    assert "--extension" in prepared.command
+    assert "--no-extensions" in prepared.command
+    assert "--no-context-files" in prepared.command
+    assert prepared.cwd == str(tmp_path)
+    assert "bugdb_add_lead" in prepared.command[prepared.command.index("--tools") + 1]
+    extension_path = str(Path("connectors") / "agentflow-connector-bridge.ts")
+    extension = prepared.runtime_files[extension_path]
+    assert "pi.registerTool" in extension
+    assert "bugdb_add_lead" in extension
+    assert "http://127.0.0.1:4312/mcp" in extension
 
 
 def test_pi_adapter_forwards_api_key_env(tmp_path, monkeypatch):
