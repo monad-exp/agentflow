@@ -924,7 +924,7 @@ class Orchestrator:
                 f"run `{run_id}` has no persisted source commit and cannot be recovered in place"
             )
 
-        from agentflow.worktree import repository_root
+        from agentflow.worktree import create_pinned_worktree, repository_root
 
         repo_dir = await asyncio.to_thread(repository_root, declared.working_path)
         relative_workdir = declared.working_path.relative_to(repo_dir)
@@ -934,9 +934,46 @@ class Orchestrator:
             raise ValueError(
                 f"run `{run_id}` does not reference its persisted source worktree"
             )
-        if not worktree_dir.is_dir():
+
+        snapshot_path = self.store.run_artifact_dir(run_id) / "source-snapshot.json"
+        try:
+            artifact = SourceSnapshotSpec.model_validate_json(
+                snapshot_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValidationError) as exc:
             raise ValueError(
-                f"run `{run_id}` source worktree is missing: {worktree_dir}"
+                f"run `{run_id}` source snapshot artifact is missing or invalid"
+            ) from exc
+        if artifact != source:
+            raise ValueError(
+                f"run `{run_id}` source snapshot artifact does not match persisted run state"
+            )
+        if (
+            source.repository_url != requested_source.repository_url
+            or source.input_ref != requested_source.input_ref
+        ):
+            raise ValueError(
+                f"run `{run_id}` source snapshot does not match its declared source"
+            )
+
+        if not worktree_dir.is_dir():
+            try:
+                recreated = await asyncio.to_thread(
+                    create_pinned_worktree,
+                    repo_dir,
+                    run_id,
+                    source.commit_sha,
+                )
+            except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+                raise ValueError(
+                    f"run `{run_id}` source worktree could not be recreated at {source.commit_sha}"
+                ) from exc
+            if recreated.resolve() != worktree_dir.resolve():
+                raise ValueError(f"run `{run_id}` source worktree was recreated at an unexpected path")
+            await self._publish(
+                run_id,
+                "source_worktree_recreated",
+                commit_sha=source.commit_sha,
             )
 
         def inspect_worktree() -> tuple[str, str]:
@@ -966,27 +1003,6 @@ class Orchestrator:
             )
         if status:
             raise ValueError(f"run `{run_id}` source worktree has local changes")
-
-        snapshot_path = self.store.run_artifact_dir(run_id) / "source-snapshot.json"
-        try:
-            artifact = SourceSnapshotSpec.model_validate_json(
-                snapshot_path.read_text(encoding="utf-8")
-            )
-        except (OSError, ValidationError) as exc:
-            raise ValueError(
-                f"run `{run_id}` source snapshot artifact is missing or invalid"
-            ) from exc
-        if artifact != source:
-            raise ValueError(
-                f"run `{run_id}` source snapshot artifact does not match persisted run state"
-            )
-        if (
-            source.repository_url != requested_source.repository_url
-            or source.input_ref != requested_source.input_ref
-        ):
-            raise ValueError(
-                f"run `{run_id}` source snapshot does not match its declared source"
-            )
 
     async def recover(
         self,
