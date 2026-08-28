@@ -595,6 +595,82 @@ def test_pi_adapter_rolls_over_provider_blocked_session_without_removing_it(tmp_
     assert transcript.exists()
 
 
+def test_pi_adapter_rolls_over_large_session_after_provider_timeout(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "deduplicate",
+            "agent": "pi",
+            "prompt": "Deduplicate",
+            "durable_goal": {"mode": "supervised"},
+        }
+    )
+    session_dir = tmp_path / ".runtime" / "pi-sessions"
+    session_dir.mkdir(parents=True)
+    transcript = session_dir / "oversized.jsonl"
+    transcript.write_text(
+        ("x" * (2 * 1024 * 1024))
+        + '\n{"type":"message","message":{"role":"assistant","stopReason":"error",'
+        '"errorMessage":"Upstream idle timeout exceeded"}}\n',
+        encoding="utf-8",
+    )
+
+    prepared = PiAdapter().prepare(node, "Deduplicate", _paths(tmp_path))
+
+    session_dir_index = prepared.command.index("--session-dir")
+    assert prepared.command[session_dir_index + 1] == str(
+        tmp_path / ".runtime" / "pi-sessions-recovery-1"
+    )
+    assert transcript.exists()
+
+
+def test_pi_adapter_keeps_small_session_after_transient_provider_timeout(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "deduplicate",
+            "agent": "pi",
+            "prompt": "Deduplicate",
+            "durable_goal": {"mode": "supervised"},
+        }
+    )
+    session_dir = tmp_path / ".runtime" / "pi-sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir / "transient.jsonl").write_text(
+        '{"type":"message","message":{"role":"assistant","stopReason":"error",'
+        '"errorMessage":"Upstream idle timeout exceeded"}}\n',
+        encoding="utf-8",
+    )
+
+    prepared = PiAdapter().prepare(node, "Deduplicate", _paths(tmp_path))
+
+    session_dir_index = prepared.command.index("--session-dir")
+    assert prepared.command[session_dir_index + 1] == str(session_dir)
+
+
+def test_pi_adapter_keeps_large_session_after_later_healthy_response(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "deduplicate",
+            "agent": "pi",
+            "prompt": "Deduplicate",
+            "durable_goal": {"mode": "supervised"},
+        }
+    )
+    session_dir = tmp_path / ".runtime" / "pi-sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir / "recovered.jsonl").write_text(
+        ("x" * (2 * 1024 * 1024))
+        + '\n{"type":"message","message":{"role":"assistant","stopReason":"error",'
+        '"errorMessage":"Upstream idle timeout exceeded"}}\n'
+        + '{"type":"message","message":{"role":"assistant","stopReason":"stop"}}\n',
+        encoding="utf-8",
+    )
+
+    prepared = PiAdapter().prepare(node, "Deduplicate", _paths(tmp_path))
+
+    session_dir_index = prepared.command.index("--session-dir")
+    assert prepared.command[session_dir_index + 1] == str(session_dir)
+
+
 def test_pi_adapter_continues_latest_healthy_recovery_session(tmp_path):
     node = NodeSpec.model_validate(
         {

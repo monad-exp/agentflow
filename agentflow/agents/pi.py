@@ -12,7 +12,12 @@ from agentflow.specs import NodeSpec, ProviderConfig, RepoInstructionsMode, Tool
 _PI_READ_ONLY_TOOLS = "read,grep,find,ls"
 _PI_READ_WRITE_TOOLS = "read,bash,edit,write,grep,find,ls"
 _PI_BLOCKED_SESSION_ERRORS = ("Request blocked: prompt injection patterns detected",)
+_PI_OVERSIZED_SESSION_ERRORS = (
+    "Upstream idle timeout exceeded",
+    "Provider finish_reason: error",
+)
 _PI_SESSION_ERROR_SCAN_BYTES = 256 * 1024
+_PI_SESSION_ROLLOVER_MIN_BYTES = 2 * 1024 * 1024
 
 
 class PiAdapter(AgentAdapter):
@@ -40,8 +45,9 @@ class PiAdapter(AgentAdapter):
         if node.durable_goal is not None and node.durable_goal.mode == "supervised":
             # Keep each durable node's Pi history alongside its other runtime
             # state. If a provider rejects the latest transcript before
-            # inference, retain it and continue in a numbered recovery
-            # directory rather than resending an unserviceable context.
+            # inference, or a large transcript repeatedly becomes
+            # unserviceable upstream, retain it and continue in a numbered
+            # recovery directory rather than resending the same context.
             session_dir = self._durable_session_dir(Path(paths.target_runtime_dir))
             command.extend([
                 "--session-dir",
@@ -139,12 +145,38 @@ class PiAdapter(AgentAdapter):
             return False
         latest = max(transcripts, key=lambda path: path.stat().st_mtime_ns)
         try:
+            transcript_size = latest.stat().st_size
             with latest.open("rb") as handle:
-                handle.seek(max(0, latest.stat().st_size - _PI_SESSION_ERROR_SCAN_BYTES))
+                handle.seek(max(0, transcript_size - _PI_SESSION_ERROR_SCAN_BYTES))
                 tail = handle.read().decode("utf-8", errors="replace")
         except OSError:
             return False
-        return any(marker in tail for marker in _PI_BLOCKED_SESSION_ERRORS)
+        latest_error = PiAdapter._latest_assistant_error(tail)
+        if any(marker in latest_error for marker in _PI_BLOCKED_SESSION_ERRORS):
+            return True
+        return transcript_size >= _PI_SESSION_ROLLOVER_MIN_BYTES and any(
+            marker in latest_error for marker in _PI_OVERSIZED_SESSION_ERRORS
+        )
+
+    @staticmethod
+    def _latest_assistant_error(tail: str) -> str:
+        for line in reversed(tail.splitlines()):
+            try:
+                payload = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if payload.get("type") != "message":
+                continue
+            message = payload.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            if message.get("stopReason") != "error":
+                return ""
+            error = message.get("errorMessage")
+            return error if isinstance(error, str) else ""
+        # Older Pi transcripts and imported sessions may contain only the
+        # provider's plain-text terminal error.
+        return tail
 
     def _render_connector_extension(self, node: NodeSpec) -> str:
         registrations: list[str] = []
