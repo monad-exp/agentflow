@@ -1000,14 +1000,16 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
     class RecoveryConnectorManager:
         def __init__(self):
             self.started: list[str] = []
+            self.fetched: list[tuple[str, str, str]] = []
             self.bound: list[tuple[str, str, str]] = []
             self.stopped: list[str] = []
 
         async def start(self, run_id, _pipeline, _run_dir):
             self.started.append(run_id)
 
-        async def fetch_collection(self, _run_id, _connector, _resource):
-            raise AssertionError("persisted fan-out must not be expanded again")
+        async def fetch_collection(self, run_id, connector, resource):
+            self.fetched.append((run_id, connector, resource))
+            return ["hunt-durable", "hunt-appended"]
 
         def bind_member(self, run_id, node, item_id):
             self.bound.append((run_id, node.id, item_id))
@@ -1140,13 +1142,18 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
     assert completed.nodes["rank"].status == NodeStatus.COMPLETED
     assert completed.nodes["hunt"].status == NodeStatus.COMPLETED
     assert completed.nodes["hunt_0"].status == NodeStatus.COMPLETED
+    assert completed.nodes["hunt_1"].status == NodeStatus.COMPLETED
     assert completed.nodes["report"].status == NodeStatus.COMPLETED
     assert [attempt.number for attempt in completed.nodes["hunt_0"].attempts] == [1, 2, 3]
     assert completed.nodes["hunt_0"].attempts[0].status == NodeStatus.CANCELLED
     assert completed.nodes["hunt_0"].attempts[1].status == NodeStatus.FAILED
     assert completed.nodes["hunt_0"].attempts[2].status == NodeStatus.COMPLETED
     assert connector_manager.started == [run_id]
-    assert connector_manager.bound == [(run_id, "hunt_0", "hunt-durable")]
+    assert connector_manager.fetched == [(run_id, "bugdb", "hunts")]
+    assert connector_manager.bound == [
+        (run_id, "hunt_0", "hunt-durable"),
+        (run_id, "hunt_1", "hunt-appended"),
+    ]
     assert connector_manager.stopped == [run_id]
     event_types = [event.type for event in orchestrator.store.get_events(run_id)]
     assert "run_recovery_queued" in event_types
@@ -1155,6 +1162,73 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
     assert "source_worktree_recreated" in event_types
     assert "source_snapshot_persisted" not in event_types
     assert not source_worktree.exists()
+
+
+@pytest.mark.asyncio
+async def test_runtime_fanout_refresh_rejects_reordered_stable_ids(tmp_path: Path):
+    class ReorderedConnectorManager:
+        async def fetch_collection(self, _run_id, _connector, _resource):
+            return ["hunt-second", "hunt-first"]
+
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "refresh-prefix",
+            "working_dir": str(tmp_path),
+            "connectors": [
+                {
+                    "name": "bugdb",
+                    "url": "http://127.0.0.1:{port}/mcp",
+                    "control_url": "http://127.0.0.1:{port}/orchestration",
+                    "command": "unused",
+                }
+            ],
+            "nodes": [
+                {"id": "rank", "agent": "codex", "prompt": "rank"},
+                {
+                    "id": "hunt",
+                    "agent": "codex",
+                    "prompt": "hunt",
+                    "depends_on": ["rank"],
+                    "connectors": ["bugdb"],
+                    "fanout_from": {
+                        "from": "rank",
+                        "connector": "bugdb",
+                        "resource": "hunts",
+                    },
+                },
+            ],
+        }
+    )
+    template = pipeline.node_map["hunt"]
+    members, member_ids = expand_runtime_fanout_node(template, ["hunt-first", "hunt-second"])
+    pipeline.nodes.extend(members)
+    pipeline.fanouts["hunt"] = member_ids
+    run_id = orchestrator.store.new_run_id()
+    record = RunRecord(
+        id=run_id,
+        status=RunStatus.QUEUED,
+        pipeline=pipeline,
+        declared_pipeline=pipeline.model_copy(deep=True),
+        nodes={
+            "rank": NodeResult(node_id="rank", status=NodeStatus.COMPLETED),
+            "hunt": NodeResult(node_id="hunt", status=NodeStatus.PENDING),
+            **{
+                member.id: NodeResult(node_id=member.id, status=NodeStatus.COMPLETED)
+                for member in members
+            },
+        },
+    )
+    await orchestrator.store.create_run(record)
+    orchestrator._connector_manager = ReorderedConnectorManager()
+
+    with pytest.raises(ValueError, match="persisted stable ID prefix"):
+        await orchestrator._expand_runtime_fanout(
+            run_id,
+            template,
+            node_map=record.pipeline.node_map,
+            remaining={"hunt"},
+        )
 
 
 @pytest.mark.asyncio

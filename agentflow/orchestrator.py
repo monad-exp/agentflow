@@ -1798,8 +1798,20 @@ class Orchestrator:
                 f"connector-backed runtime fan-out {template.id!r} returned duplicate stable IDs"
             )
 
+        prior_member_ids = record.pipeline.fanouts.get(template.id, [])
+        prior_values = [
+            node_map[member_id].fanout_member.get("value")
+            if member_id in node_map and node_map[member_id].fanout_member is not None
+            else None
+            for member_id in prior_member_ids
+        ]
+        if prior_member_ids and values[: len(prior_values)] != prior_values:
+            raise ValueError(
+                f"runtime fan-out {template.id!r} no longer preserves its persisted stable ID prefix"
+            )
+
         members, member_ids = expand_runtime_fanout_node(template, values)
-        collisions = sorted(set(member_ids) & set(node_map))
+        collisions = sorted((set(member_ids) & set(node_map)) - set(prior_member_ids))
         if collisions:
             raise ValueError(
                 f"runtime fan-out {template.id!r} produced node ids that already exist: {collisions}"
@@ -1819,6 +1831,18 @@ class Orchestrator:
             members=member_ids,
         )
         for index, member in enumerate(members):
+            if member.id in prior_member_ids:
+                existing = node_map.get(member.id)
+                if (
+                    existing is None
+                    or existing.fanout_group != template.id
+                    or existing.fanout_member is None
+                    or existing.fanout_member.get("value") != values[index]
+                ):
+                    raise ValueError(
+                        f"runtime fan-out {template.id!r} cannot reconcile persisted member {member.id!r}"
+                    )
+                continue
             if fanout.connector is not None:
                 self._connector_manager.bind_member(run_id, member, values[index])
             record.pipeline.nodes.append(member)
@@ -2005,7 +2029,11 @@ class Orchestrator:
             for node_id, node in node_map.items()
             if node.fanout_from is not None
         }
-        runtime_expanded = set(record.pipeline.fanouts) & set(runtime_templates)
+        runtime_expanded = {
+            template_id
+            for template_id in set(record.pipeline.fanouts) & set(runtime_templates)
+            if record.nodes[template_id].status == NodeStatus.COMPLETED
+        }
         remaining.difference_update(runtime_expanded)
         pool_semaphores = {
             name: asyncio.Semaphore(limit)
