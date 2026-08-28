@@ -272,8 +272,15 @@ export async function createFindings(
     const leads = await tx.lead.findMany({
       where: { hunt: { runId: scope.runId } },
     });
-    if (!sameStringSet(leads.map((lead) => lead.id), allLeadIds)) {
-      throw new Error("Finding input must partition every Lead in this AgentFlow run exactly once");
+    const requestFindingIds = new Set(ids);
+    const requiredLeadIds = leads
+      .filter((lead) => lead.findingId === null || requestFindingIds.has(lead.findingId))
+      .map((lead) => lead.id);
+    if (!sameStringSet(requiredLeadIds, allLeadIds)) {
+      throw new Error(
+        "Finding input must partition every Lead currently unassigned exactly once and fully replay "
+        + "the membership of each requested existing Finding",
+      );
     }
     for (const [index, finding] of input.findings.entries()) {
       const id = ids[index];
