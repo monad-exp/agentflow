@@ -11,6 +11,8 @@ from agentflow.specs import NodeSpec, ProviderConfig, RepoInstructionsMode, Tool
 
 _PI_READ_ONLY_TOOLS = "read,grep,find,ls"
 _PI_READ_WRITE_TOOLS = "read,bash,edit,write,grep,find,ls"
+_PI_BLOCKED_SESSION_ERRORS = ("Request blocked: prompt injection patterns detected",)
+_PI_SESSION_ERROR_SCAN_BYTES = 256 * 1024
 
 
 class PiAdapter(AgentAdapter):
@@ -37,11 +39,13 @@ class PiAdapter(AgentAdapter):
         ]
         if node.durable_goal is not None and node.durable_goal.mode == "supervised":
             # Keep each durable node's Pi history alongside its other runtime
-            # state. --continue creates a session when none exists and resumes
-            # the most recent one on retries or process-level recovery.
+            # state. If a provider rejects the latest transcript before
+            # inference, retain it and continue in a numbered recovery
+            # directory rather than resending an unserviceable context.
+            session_dir = self._durable_session_dir(Path(paths.target_runtime_dir))
             command.extend([
                 "--session-dir",
-                str(Path(paths.target_runtime_dir) / "pi-sessions"),
+                str(session_dir),
                 "--continue",
             ])
         else:
@@ -106,6 +110,41 @@ class PiAdapter(AgentAdapter):
             runtime_files=runtime_files,
             stdin=prompt,
         )
+
+    @classmethod
+    def _durable_session_dir(cls, runtime_dir: Path) -> Path:
+        base = runtime_dir / "pi-sessions"
+        recovery_dirs = sorted(
+            (
+                path
+                for path in runtime_dir.glob("pi-sessions-recovery-*")
+                if path.is_dir() and path.name.removeprefix("pi-sessions-recovery-").isdigit()
+            ),
+            key=lambda path: int(path.name.removeprefix("pi-sessions-recovery-")),
+        )
+        current = recovery_dirs[-1] if recovery_dirs else base
+        if not cls._session_rejected_before_inference(current):
+            return current
+        next_index = (
+            int(current.name.removeprefix("pi-sessions-recovery-")) + 1
+            if current != base
+            else 1
+        )
+        return runtime_dir / f"pi-sessions-recovery-{next_index}"
+
+    @staticmethod
+    def _session_rejected_before_inference(session_dir: Path) -> bool:
+        transcripts = list(session_dir.glob("*.jsonl")) if session_dir.is_dir() else []
+        if not transcripts:
+            return False
+        latest = max(transcripts, key=lambda path: path.stat().st_mtime_ns)
+        try:
+            with latest.open("rb") as handle:
+                handle.seek(max(0, latest.stat().st_size - _PI_SESSION_ERROR_SCAN_BYTES))
+                tail = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            return False
+        return any(marker in tail for marker in _PI_BLOCKED_SESSION_ERRORS)
 
     def _render_connector_extension(self, node: NodeSpec) -> str:
         registrations: list[str] = []

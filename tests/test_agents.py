@@ -568,6 +568,60 @@ def test_pi_adapter_resumes_node_scoped_session_for_supervised_durable_goal(tmp_
     assert prepared.command[session_dir_index + 1] == str(tmp_path / ".runtime" / "pi-sessions")
 
 
+def test_pi_adapter_rolls_over_provider_blocked_session_without_removing_it(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "hunt",
+            "agent": "pi",
+            "prompt": "Hunt",
+            "durable_goal": {"mode": "supervised"},
+        }
+    )
+    session_dir = tmp_path / ".runtime" / "pi-sessions"
+    session_dir.mkdir(parents=True)
+    transcript = session_dir / "blocked.jsonl"
+    transcript.write_text(
+        '{"type":"message","message":{"role":"assistant","stopReason":"error",'
+        '"errorMessage":"Request blocked: prompt injection patterns detected"}}\n',
+        encoding="utf-8",
+    )
+
+    prepared = PiAdapter().prepare(node, "Hunt", _paths(tmp_path))
+
+    session_dir_index = prepared.command.index("--session-dir")
+    assert prepared.command[session_dir_index + 1] == str(
+        tmp_path / ".runtime" / "pi-sessions-recovery-1"
+    )
+    assert transcript.exists()
+
+
+def test_pi_adapter_continues_latest_healthy_recovery_session(tmp_path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "hunt",
+            "agent": "pi",
+            "prompt": "Hunt",
+            "durable_goal": {"mode": "supervised"},
+        }
+    )
+    blocked_dir = tmp_path / ".runtime" / "pi-sessions"
+    blocked_dir.mkdir(parents=True)
+    (blocked_dir / "blocked.jsonl").write_text(
+        'Request blocked: prompt injection patterns detected\n', encoding="utf-8"
+    )
+    recovery_dir = tmp_path / ".runtime" / "pi-sessions-recovery-1"
+    recovery_dir.mkdir()
+    (recovery_dir / "healthy.jsonl").write_text(
+        '{"type":"message","message":{"role":"assistant","stopReason":"stop"}}\n',
+        encoding="utf-8",
+    )
+
+    prepared = PiAdapter().prepare(node, "Hunt", _paths(tmp_path))
+
+    session_dir_index = prepared.command.index("--session-dir")
+    assert prepared.command[session_dir_index + 1] == str(recovery_dir)
+
+
 def test_pi_adapter_read_only_tool_mapping(tmp_path):
     node = NodeSpec.model_validate(
         {"id": "scan", "agent": "pi", "prompt": "Scan", "tools": "read_only"}
