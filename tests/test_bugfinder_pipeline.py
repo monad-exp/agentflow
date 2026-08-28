@@ -47,11 +47,22 @@ def test_bugfinder_factory_builds_the_production_graph(tmp_path: Path):
     assert pipeline.connectors[0].url == "http://127.0.0.1:{port}/mcp"
     assert pipeline.connectors[0].tools == []
     assert pipeline.deadline_seconds == 14400
-    assert pipeline.node_map["hunt"].durable_goal is not None
-    assert pipeline.node_map["deduplicate"].durable_goal is not None
-    assert pipeline.node_map["deduplicate"].durable_goal.mode == "supervised"
-    assert pipeline.node_map["rank_files"].durable_goal is None
-    assert pipeline.node_map["deduplicate"].retries == 4
+    connector_node_ids = {
+        "rank_files",
+        "threat_model",
+        "roam_plan",
+        "hunt",
+        "deduplicate",
+        "triage",
+        "rereview",
+    }
+    for node_id in connector_node_ids:
+        node = pipeline.node_map[node_id]
+        assert node.durable_goal is not None
+        assert node.durable_goal.mode == "supervised"
+        assert node.retries == 4
+    assert pipeline.node_map["report"].durable_goal is None
+    assert pipeline.node_map["report"].retries == 0
     assert "at most 1,500 tokens" in pipeline.node_map["deduplicate"].prompt
     assert "your next substantive action" in pipeline.node_map["deduplicate"].prompt
     assert "before reaching the response limit" in pipeline.node_map["deduplicate"].prompt
