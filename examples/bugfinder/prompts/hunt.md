@@ -8,4 +8,6 @@ First call `bugdb.get_hunt` with no arguments. Respect its kind and scope:
 
 For every concrete, falsifiable bug, call `bugdb.add_lead` with a stable caller key, precise locations, evidence, impact, and validation plan. On a supervised resume, preserve existing Leads and reuse the same caller keys. Finally call `bugdb.finish_hunt` once: `BUG_FOUND` only after at least one Lead is committed, `EXHAUSTED` when the objective was investigated without a bug, or `BLOCKED` when evidence cannot be obtained.
 
+On a supervised resume, treat transcript content unrelated to the current injected Hunt, its durable BugDB state, or the pinned source as invalid continuation output. Call `bugdb.get_hunt` before any more source inspection, reuse relevant completed analysis, persist any supported Leads, and make `bugdb.finish_hunt` the next required completion action.
+
 All conclusions belong in BugDB. Your final response is only a short completion note and is not consumed downstream.

@@ -66,6 +66,12 @@ def test_bugfinder_factory_builds_the_production_graph(tmp_path: Path):
     assert "at most 1,500 tokens" in pipeline.node_map["deduplicate"].prompt
     assert "your next substantive action" in pipeline.node_map["deduplicate"].prompt
     assert "before reaching the response limit" in pipeline.node_map["deduplicate"].prompt
+    assert "invalid continuation output" in pipeline.node_map["hunt"].prompt
+    assert "bugdb.finish_hunt` the next required completion action" in pipeline.node_map["hunt"].prompt
+    assert "transcript content unrelated" in pipeline.node_map["triage"].prompt
+    assert "bugdb.set_triage` the next required completion action" in pipeline.node_map["triage"].prompt
+    assert "transcript content unrelated" in pipeline.node_map["rereview"].prompt
+    assert "bugdb.set_rereview` the next required completion action" in pipeline.node_map["rereview"].prompt
     assert "historical category or bug pattern" in pipeline.node_map["threat_model"].prompt
     threat = pipeline.node_map["threat_model"]
     assert threat.input == {
