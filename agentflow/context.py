@@ -8,8 +8,23 @@ from agentflow.specs import NodeResult, NodeSpec, NodeStatus, PipelineSpec, norm
 from agentflow.utils import render_template
 
 
+def _run_dir(run_id: str, artifacts_base_dir: Path) -> Path:
+    return artifacts_base_dir.expanduser().resolve() / run_id
+
+
+def _run_paths_context(*, run_id: str, artifacts_base_dir: Path) -> dict[str, Any]:
+    run_dir = _run_dir(run_id, artifacts_base_dir)
+    return {
+        "id": run_id,
+        "directory": str(run_dir),
+        "artifacts_directory": str(run_dir / "artifacts"),
+        "runtime_directory": str(run_dir / "runtime"),
+    }
+
+
 def _artifact_paths_context(*, run_id: str, artifacts_base_dir: Path, node_id: str) -> dict[str, Any]:
-    artifact_dir = artifacts_base_dir.expanduser().resolve() / run_id / "artifacts" / node_id
+    run_dir = _run_dir(run_id, artifacts_base_dir)
+    artifact_dir = run_dir / "artifacts" / node_id
     return {
         "directory": str(artifact_dir),
         "stdout_log": str(artifact_dir / "stdout.log"),
@@ -18,6 +33,7 @@ def _artifact_paths_context(*, run_id: str, artifacts_base_dir: Path, node_id: s
         "output_txt": str(artifact_dir / "output.txt"),
         "result_json": str(artifact_dir / "result.json"),
         "launch_json": str(artifact_dir / "launch.json"),
+        "runtime_dir": str(run_dir / "runtime" / node_id),
     }
 
 
@@ -184,6 +200,8 @@ def build_render_context(
         for member in member_nodes:
             fanout_member_contexts[member["id"]] = member
     context = {"pipeline": pipeline.model_dump(mode="json"), "nodes": nodes, "fanouts": fanouts}
+    if run_id is not None and artifacts_base_dir is not None:
+        context["run"] = _run_paths_context(run_id=run_id, artifacts_base_dir=artifacts_base_dir)
     if current_node is not None:
         current_context = _current_node_context(
             current_node,

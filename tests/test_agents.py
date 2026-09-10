@@ -548,6 +548,8 @@ def test_pi_adapter_uses_pi_cli_directly(tmp_path):
     # interpret it as a flag or @file reference.
     assert prepared.stdin == "Review"
     assert "Review" not in prepared.command
+    # Inherit mode keeps Pi in the checkout so repo-local configuration applies.
+    assert prepared.cwd == str(tmp_path)
 
 
 def test_pi_adapter_resumes_node_scoped_session_for_supervised_durable_goal(tmp_path):
@@ -676,7 +678,7 @@ def test_pi_adapter_honors_repo_instructions_ignore(tmp_path):
     assert "--no-extensions" in prepared.command
     assert "--no-prompt-templates" in prepared.command
     assert "--no-context-files" in prepared.command
-    assert prepared.cwd == str(tmp_path)
+    assert prepared.cwd == str(tmp_path / ".runtime")
     assert f"AgentFlow pinned source checkout: {json.dumps(str(tmp_path))}" in (prepared.stdin or "")
 
 
@@ -726,7 +728,7 @@ def test_pi_adapter_bridges_run_scoped_connector_tools_with_an_extension(tmp_pat
     assert "--extension" in prepared.command
     assert "--no-extensions" in prepared.command
     assert "--no-context-files" in prepared.command
-    assert prepared.cwd == str(tmp_path)
+    assert prepared.cwd == str(tmp_path / ".runtime")
     assert "bugdb_add_lead" in prepared.command[prepared.command.index("--tools") + 1]
     extension_path = str(Path("connectors") / "agentflow-connector-bridge.ts")
     extension = prepared.runtime_files[extension_path]

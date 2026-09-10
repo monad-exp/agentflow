@@ -85,6 +85,7 @@ class PiAdapter(AgentAdapter):
         if node.model:
             command.extend(["--model", node.model])
 
+        cwd = paths.target_workdir
         if repo_instructions_ignored:
             command.extend([
                 "--no-skills",
@@ -93,6 +94,8 @@ class PiAdapter(AgentAdapter):
                 "--no-context-files",
             ])
             prompt = self.source_checkout_prompt(prompt, paths)
+            # Start outside the checkout so repo-local Pi configuration is never discovered.
+            cwd = str(Path(paths.target_runtime_dir))
 
         command.extend(node.extra_args)
 
@@ -101,7 +104,7 @@ class PiAdapter(AgentAdapter):
         return PreparedExecution(
             command=command,
             env=env,
-            cwd=paths.target_workdir,
+            cwd=cwd,
             trace_kind="pi",
             runtime_files=runtime_files,
             stdin=prompt,

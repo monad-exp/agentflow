@@ -1512,13 +1512,58 @@ class ConnectorToolCalledCriterion(BaseModel):
         return normalized
 
 
+class OutputJsonSchemaCriterion(BaseModel):
+    """Validate the node's parsed JSON final response against a Draft 2020-12 schema.
+
+    The wire field is ``schema``; the attribute is ``json_schema`` because
+    ``schema`` shadows a pydantic ``BaseModel`` method.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    kind: Literal["output_json_schema"] = "output_json_schema"
+    json_schema: dict[str, Any] = Field(alias="schema")
+
+    @field_validator("json_schema")
+    @classmethod
+    def validate_json_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
+        check_json_schema(value, label="output_json_schema schema")
+        return value
+
+
+class FileJsonSchemaCriterion(BaseModel):
+    """Validate a JSON file the node wrote against a Draft 2020-12 schema.
+
+    ``root`` selects the node runtime directory (default) or the pipeline
+    working directory. ``modified_in_attempt`` additionally requires the file
+    to have been written during the evaluated attempt, so a stale file from an
+    earlier attempt cannot satisfy the criterion.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    kind: Literal["file_json_schema"] = "file_json_schema"
+    path: str
+    json_schema: dict[str, Any] = Field(alias="schema")
+    root: Literal["runtime", "workdir"] = "runtime"
+    modified_in_attempt: bool = True
+
+    @field_validator("json_schema")
+    @classmethod
+    def validate_json_schema(cls, value: dict[str, Any]) -> dict[str, Any]:
+        check_json_schema(value, label="file_json_schema schema")
+        return value
+
+
 SuccessCriterion = Annotated[
     OutputContainsCriterion
     | OutputRegexCriterion
     | FileExistsCriterion
     | FileContainsCriterion
     | FileNonEmptyCriterion
-    | ConnectorToolCalledCriterion,
+    | ConnectorToolCalledCriterion
+    | OutputJsonSchemaCriterion
+    | FileJsonSchemaCriterion,
     Field(discriminator="kind"),
 ]
 
