@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HistoryCatalog",
+  "description": "Deduplicated historical risk catalog with candidate mappings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "items",
+    "sourceAttemptIds",
+    "mappings"
+  ],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "threatId",
+          "statement",
+          "attackSurface",
+          "attackerCapability",
+          "protectedAsset",
+          "securityImpact",
+          "excludedPreconditions",
+          "sourceIssueRefs",
+          "knownFindingRefs",
+          "confidence"
+        ],
+        "properties": {
+          "threatId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "statement": {
+            "type": "string",
+            "minLength": 1
+          },
+          "attackSurface": {
+            "type": "string",
+            "minLength": 1
+          },
+          "attackerCapability": {
+            "type": "string",
+            "minLength": 1
+          },
+          "protectedAsset": {
+            "type": "string",
+            "minLength": 1
+          },
+          "securityImpact": {
+            "type": "string",
+            "minLength": 1
+          },
+          "excludedPreconditions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "sourceIssueRefs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "knownFindingRefs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        }
+      }
+    },
+    "sourceAttemptIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "mappings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sourceAttemptId",
+          "sourceKey",
+          "threatId",
+          "disposition"
+        ],
+        "properties": {
+          "sourceAttemptId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sourceKey": {
+            "type": "string",
+            "minLength": 1
+          },
+          "threatId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "disposition": {
+            "type": "string",
+            "enum": [
+              "RETAINED",
+              "DEDUPLICATED"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
