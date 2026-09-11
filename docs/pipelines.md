@@ -157,11 +157,13 @@ messages list every violation as `<json pointer>: <message>` (sorted, at most
 
 ### Retry feedback
 
-When a node retries after an attempt whose criteria failed, the retry prompt
-ends with the failed lines of the previous attempt (lines ending in `=True`
-are omitted, the list is capped at 2000 characters). Only in-loop retries get
-this suffix: the attempt that process recovery or `rerun` starts after a
-cancelled attempt receives the unmodified prompt.
+When a model node (`codex`, `claude`, `kimi`, or `pi`) retries after an attempt
+whose criteria failed, the retry prompt ends with the failed lines of the
+previous attempt (lines ending in `=True` are omitted, the list is capped at
+2000 characters). Only in-loop retries get this suffix: the attempt that
+process recovery or `rerun` starts after a cancelled attempt receives the
+unmodified prompt. Utility nodes (`python`, `shell`, and `sync`) keep their
+original executable source or mode on retry.
 
 ```text
 AgentFlow previous attempt did not meet its success criteria:

@@ -1368,6 +1368,78 @@ RUN_IDENTITY_KEYS = (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent", "code"),
+    [
+        (
+            "python",
+            "import json\n"
+            "from pathlib import Path\n"
+            "marker = Path('retry-marker')\n"
+            "count = 2 if marker.exists() else 'many'\n"
+            "marker.touch()\n"
+            "print(json.dumps({'count': count}))\n",
+        ),
+        (
+            "shell",
+            "if [ -f retry-marker ]; then\n"
+            "  printf '{\"count\": 2}\\n'\n"
+            "else\n"
+            "  touch retry-marker\n"
+            "  printf '{\"count\": \"many\"}\\n'\n"
+            "fi\n",
+        ),
+    ],
+    ids=["python", "shell"],
+)
+async def test_utility_retry_preserves_executable_source_after_schema_failure(
+    tmp_path: Path, agent: str, code: str
+):
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "utility-retry",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {
+                    "id": "collect",
+                    "agent": agent,
+                    "prompt": code,
+                    "retries": 1,
+                    "retry_backoff_seconds": 0,
+                    "success_criteria": [
+                        {
+                            "kind": "output_json_schema",
+                            "schema": {
+                                "type": "object",
+                                "required": ["count"],
+                                "properties": {"count": {"type": "integer"}},
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=10)
+
+    node = completed.nodes["collect"]
+    first, second = node.attempts
+    assert first.status == NodeStatus.FAILED
+    assert first.exit_code == 0
+    assert first.success is False
+    assert json.loads(first.output) == {"count": "many"}
+    assert second.status == NodeStatus.COMPLETED
+    assert second.exit_code == 0
+    assert second.success is True
+    assert json.loads(second.output) == {"count": 2}
+    assert completed.status == RunStatus.COMPLETED
+    assert node.stderr_lines == []
+
+
+@pytest.mark.asyncio
 async def test_retry_prompt_lists_only_the_failed_criteria_of_the_previous_attempt(tmp_path: Path):
     orchestrator = _orchestrator(tmp_path)
     pipeline = PipelineSpec.model_validate(

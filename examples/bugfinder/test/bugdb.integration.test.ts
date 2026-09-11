@@ -160,7 +160,40 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
       createFindings(prisma, runScope, {
         findings: [{ ...findingAppend.findings[0], leadIds: [fileLead.id] }],
       }),
-    ).rejects.toThrow(/partition every Lead/);
+    ).rejects.toThrow(
+      `missing Lead IDs (1): [${JSON.stringify(threatLead.id)}]; unknown Lead IDs (0): []`,
+    );
+    expect(await prisma.finding.count({ where: { runId } })).toBe(0);
+    expect(await prisma.lead.count({ where: { id: { in: [fileLead.id, threatLead.id] }, findingId: null } })).toBe(2);
+    const unknownLeadId = `lead_${"f".repeat(64)}`;
+    await expect(
+      createFindings(prisma, runScope, {
+        findings: [{ ...findingAppend.findings[0], leadIds: [fileLead.id, unknownLeadId] }],
+      }),
+    ).rejects.toThrow(
+      `missing Lead IDs (1): [${JSON.stringify(threatLead.id)}]; unknown Lead IDs (1): [${JSON.stringify(unknownLeadId)}]`,
+    );
+    const manyUnknownLeadIds = Array.from(
+      { length: 21 },
+      (_, index) => `lead_unknown_${index.toString().padStart(2, "0")}`,
+    );
+    await expect(
+      createFindings(prisma, runScope, {
+        findings: [{ ...findingAppend.findings[0], leadIds: manyUnknownLeadIds }],
+      }),
+    ).rejects.toThrow(
+      `unknown Lead IDs (21): ${JSON.stringify(manyUnknownLeadIds.slice(0, 20))} (+1 more)`,
+    );
+    await expect(
+      createFindings(prisma, runScope, {
+        findings: [{
+          ...findingAppend.findings[0],
+          leadIds: [fileLead.id, threatLead.id, fileLead.id],
+        }],
+      }),
+    ).rejects.toThrow(
+      `Lead IDs assigned more than once (1): [${JSON.stringify(fileLead.id)}]`,
+    );
     expect(await prisma.finding.count({ where: { runId } })).toBe(0);
     expect(await prisma.lead.count({ where: { id: { in: [fileLead.id, threatLead.id] }, findingId: null } })).toBe(2);
     await expect(
