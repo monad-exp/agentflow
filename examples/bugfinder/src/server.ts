@@ -76,7 +76,7 @@ const tools: Record<string, ToolDefinition> = {
     run: (scope) => listHuntsAndLeads(prisma, scope),
   },
   create_findings: {
-    description: "Create canonical Findings and assign same-run Leads transactionally.",
+    description: "Create or verify canonical Findings, partitioning all currently unassigned same-run Leads and fully replaying each requested existing Finding transactionally.",
     inputSchema: createFindingsInput,
     run: (scope, input) => createFindings(prisma, scope, input),
   },
