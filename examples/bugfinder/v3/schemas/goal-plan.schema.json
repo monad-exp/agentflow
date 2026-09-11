@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GoalPlan",
+  "description": "Goal hunts selected from the frozen threat model and history catalog.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "goals",
+    "historyDispositions"
+  ],
+  "properties": {
+    "goals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "callerKey",
+          "kind",
+          "outcome",
+          "scope",
+          "attackerCapabilities",
+          "excludedPreconditions",
+          "evidenceBar"
+        ],
+        "properties": {
+          "callerKey": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "THREAT_MODEL",
+              "HISTORICAL",
+              "ROAM"
+            ]
+          },
+          "threatId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scope": {
+            "type": "string",
+            "minLength": 1
+          },
+          "attackerCapabilities": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "excludedPreconditions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "evidenceBar": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "historyDispositions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "historicalId",
+          "disposition",
+          "rationale"
+        ],
+        "properties": {
+          "historicalId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "disposition": {
+            "type": "string",
+            "enum": [
+              "ELIGIBLE",
+              "NO_VARIANT",
+              "SKIP"
+            ]
+          },
+          "rationale": {
+            "type": "string",
+            "minLength": 1
+          },
+          "goalCallerKey": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

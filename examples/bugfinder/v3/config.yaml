@@ -1,0 +1,200 @@
+schemaVersion: 1
+
+workflow:
+  id: bugfinder-v3
+  # Retries of every agent node after a failed attempt (pipeline.agent_node).
+  retries: 1
+
+# Default budget profile; `run.py --budget` overrides it.
+budget: medium
+
+targets:
+  - id: monad
+    repository: category-labs/monad
+    repositoryUrl: https://github.com/category-labs/monad
+    sourceRef: main
+    scope:
+      include: ["**/*"]
+      exclude: ["**/*.md", "**/testdata/**", "**/*.lock"]
+
+  - id: monad-bft
+    repository: category-labs/monad-bft
+    repositoryUrl: https://github.com/category-labs/monad-bft
+    sourceRef: master
+    scope:
+      include: ["**/*"]
+      exclude: ["**/*.md", "**/testdata/**", "**/*.lock"]
+
+# A profile is one executable harness + model + reasoning tuple. The sandbox is
+# not a profile knob: AgentFlow derives it from each phase's `tools` (hunt, rank,
+# context, planning, synthesis and report nodes are read-only; gates 2 and 3
+# read-write).
+profiles:
+  codex-gpt-5-6-sol:
+    harness: codex
+    model: gpt-5.6-sol
+    reasoning: xhigh
+
+  claude-code-fable-5:
+    harness: claude
+    model: claude-fable-5
+    reasoning: max
+
+  claude-code-opus-5:
+    harness: claude
+    model: claude-opus-5
+    reasoning: max
+
+  pi-glm-5-3:
+    harness: pi
+    model: openrouter/z-ai/glm-5.3
+    reasoning: max
+    provider:
+      name: openrouter
+      base_url: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+      wire_api: openai-completions
+
+  codex-gpt-5-6-luna:
+    harness: codex
+    model: gpt-5.6-luna
+    reasoning: medium
+
+# Roles are compute policies; replica counts come from the budget.
+roles:
+  principal:
+    defaultProfile: codex-gpt-5-6-sol
+    allowedProfiles:
+      - codex-gpt-5-6-sol
+      - claude-code-fable-5
+      - claude-code-opus-5
+
+  workerSmart:
+    profiles:
+      - codex-gpt-5-6-sol
+      - claude-code-fable-5
+      - claude-code-opus-5
+      - pi-glm-5-3
+
+  # Reserved for future high-volume phases; deliberately unused by v3 (optional).
+  workerCheap:
+    profiles:
+      - codex-gpt-5-6-luna
+
+budgets:
+  low:
+    fileRankThreshold: 5
+    huntProfiles: 2
+    replicasPerProfile: 1
+    contextWorkerProfiles: 2
+    maxRoamGoals: 0
+    triageFindingCap: 8
+    validityProfiles: 2
+    maxItemsPerSlot: 256
+    timeouts:
+      rankMin: 30
+      huntMin: 30
+      contextWorkerMin: 30
+      synthesisMin: 20
+      goalPlanMin: 20
+      dedupMin: 30
+      gate1Min: 15
+      gate2Min: 30
+      gate3Min: 60
+      reportMin: 20
+    engineConcurrency: 8
+    pools:
+      codex: 4
+      claude: 2
+      pi: 2
+    deadlineHours: 12
+
+  medium:
+    fileRankThreshold: 4
+    huntProfiles: 3
+    replicasPerProfile: 1
+    contextWorkerProfiles: 3
+    maxRoamGoals: 1
+    triageFindingCap: 16
+    validityProfiles: 3
+    maxItemsPerSlot: 512
+    timeouts:
+      rankMin: 30
+      huntMin: 45
+      contextWorkerMin: 45
+      synthesisMin: 30
+      goalPlanMin: 30
+      dedupMin: 45
+      gate1Min: 20
+      gate2Min: 45
+      gate3Min: 120
+      reportMin: 30
+    engineConcurrency: 16
+    pools:
+      codex: 8
+      claude: 4
+      pi: 4
+    deadlineHours: 48
+
+  high:
+    fileRankThreshold: 3
+    huntProfiles: all
+    replicasPerProfile: 2
+    contextWorkerProfiles: all
+    maxRoamGoals: 1
+    triageFindingCap: 32
+    validityProfiles: all
+    maxItemsPerSlot: 2048
+    timeouts:
+      rankMin: 30
+      huntMin: 55
+      contextWorkerMin: 45
+      synthesisMin: 30
+      goalPlanMin: 30
+      dedupMin: 45
+      gate1Min: 20
+      gate2Min: 45
+      gate3Min: 180
+      reportMin: 30
+    engineConcurrency: 24
+    pools:
+      codex: 12
+      claude: 8
+      pi: 12
+    deadlineHours: null
+
+phases:
+  # Gate 3 reviewer; its model must differ from the context (principal) and validity models.
+  triageImpact:
+    profile: claude-code-fable-5
+
+triagePolicy:
+  guidanceSources:
+    officialDocumentation:
+      - id: monad-documentation
+        url: https://docs.monad.xyz/
+      - id: monad-ethereum-differences
+        url: https://docs.monad.xyz/developer-essentials/differences
+      - id: monad-protocol-changelog
+        url: https://docs.monad.xyz/developer-essentials/changelog
+  # Vendored copy of the bounty gist; `policy.py` encodes its matrix and PoC rules.
+  bountyTerms:
+    source: gist
+    url: https://gist.github.com/aviggiano/bbae44300630a2cc9642a7a58ef28fd0
+    revision: 908010ff44cbb1c66a96f0215ddd4f926946421b
+    path: policy/monad-bounty.md
+    sha256: 80e8caa5a8c2a0828299b8e9cc0b0a6720fccaa2b852412d606e5fc3c61e2b40
+  pocRequiredForSeverities: [CRITICAL, HIGH]
+  knownIssueSources:
+    repositories: [category-labs/monad, category-labs/monad-bft]
+  referenceClients: [geth, nethermind]
+  routing:
+    timeoutDisposition: INCONCLUSIVE
+    conflictingEvidenceDisposition: INCONCLUSIVE
+  prohibitedActions:
+    - Do not test vulnerabilities on mainnet or public testnet deployments without prior authorization; use local test environments or a private test setup.
+    - Do not publicly disclose details of any vulnerability before it has been addressed and written permission to disclose has been received.
+    - Do not exploit a vulnerability beyond the minimum steps necessary to demonstrate it, access private data, engage in social engineering, or disrupt service.
+    - Individuals currently or formerly employed by the Monad Foundation or Category Labs, or who contributed to the affected code, are ineligible; former auditors may participate once 3 months have passed since their audit ended.
+    - Social engineering attacks are out of scope and not permitted for testing.
+    - Testing of physical security is out of scope and not permitted for testing.

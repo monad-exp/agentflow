@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TriageContext",
+  "description": "Gate 1: authoritative context and validation plan for one finding.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "disposition",
+    "rationale",
+    "guidanceReview",
+    "knownIssueSearch",
+    "targetCommit",
+    "fixCommit",
+    "validityRequired",
+    "impactRequired",
+    "existingEvidenceIds",
+    "validityMethods",
+    "impactMethods"
+  ],
+  "properties": {
+    "disposition": {
+      "type": "string",
+      "enum": [
+        "REVIEW",
+        "KNOWN",
+        "INTENDED",
+        "FIXED",
+        "INCONCLUSIVE"
+      ]
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1
+    },
+    "guidanceReview": {
+      "$ref": "#/$defs/guidanceReview"
+    },
+    "knownIssueSearch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "sources",
+        "matches"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "UNAVAILABLE"
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "matches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/citation"
+          }
+        }
+      }
+    },
+    "targetCommit": {
+      "type": "string",
+      "minLength": 1
+    },
+    "fixCommit": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "validityRequired": {
+      "type": "boolean"
+    },
+    "impactRequired": {
+      "type": "boolean"
+    },
+    "existingEvidenceIds": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "validityMethods": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidenceMethod"
+      }
+    },
+    "impactMethods": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidenceMethod"
+      }
+    }
+  },
+  "$defs": {
+    "citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "url",
+        "revision",
+        "excerpt"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "documentation",
+            "bounty-terms",
+            "specification",
+            "issue",
+            "pull-request",
+            "known-finding"
+          ]
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "format": "uri"
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "excerpt": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "guidanceReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expectedBehavior",
+        "documentationStatus",
+        "bountyStatus",
+        "references"
+      ],
+      "properties": {
+        "expectedBehavior": {
+          "type": "string",
+          "minLength": 1
+        },
+        "documentationStatus": {
+          "type": "string",
+          "enum": [
+            "SUPPORTED",
+            "CONTRADICTED",
+            "UNKNOWN"
+          ]
+        },
+        "bountyStatus": {
+          "type": "string",
+          "enum": [
+            "IN_SCOPE",
+            "OUT_OF_SCOPE",
+            "UNKNOWN"
+          ]
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/citation"
+          }
+        }
+      }
+    },
+    "evidenceMethod": {
+      "type": "string",
+      "enum": [
+        "UNIT",
+        "INTEGRATION",
+        "SOLONET",
+        "DIFFERENTIAL",
+        "SANITIZER",
+        "STATIC_PROOF",
+        "STATISTICAL",
+        "EXISTING"
+      ]
+    }
+  }
+}

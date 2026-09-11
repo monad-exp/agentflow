@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HistoryCandidates",
+  "description": "Historical risk-class candidates extracted from the past-issue corpus.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidates"
+  ],
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "statement",
+          "attackSurface",
+          "attackerCapability",
+          "protectedAsset",
+          "securityImpact",
+          "excludedPreconditions",
+          "sourceIssueRefs",
+          "knownFindingRefs",
+          "confidence"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "statement": {
+            "type": "string",
+            "minLength": 1
+          },
+          "attackSurface": {
+            "type": "string",
+            "minLength": 1
+          },
+          "attackerCapability": {
+            "type": "string",
+            "minLength": 1
+          },
+          "protectedAsset": {
+            "type": "string",
+            "minLength": 1
+          },
+          "securityImpact": {
+            "type": "string",
+            "minLength": 1
+          },
+          "excludedPreconditions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "sourceIssueRefs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "knownFindingRefs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

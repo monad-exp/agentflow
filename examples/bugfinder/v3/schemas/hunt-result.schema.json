@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HuntResult",
+  "description": "Terminal result of one hunt attempt with its leads.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "result",
+    "summary",
+    "leads"
+  ],
+  "properties": {
+    "result": {
+      "type": "string",
+      "enum": [
+        "BUG_FOUND",
+        "EXHAUSTED",
+        "BLOCKED"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "leads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "callerKey",
+          "claim",
+          "locations",
+          "evidence"
+        ],
+        "properties": {
+          "callerKey": {
+            "type": "string",
+            "minLength": 1
+          },
+          "claim": {
+            "type": "string",
+            "minLength": 1
+          },
+          "locations": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1
+          },
+          "attackerPreconditions": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "impact": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "validationPlan": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
