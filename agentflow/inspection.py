@@ -40,6 +40,7 @@ from agentflow.specs import (
     NodeSpec,
     NodeStatus,
     PipelineSpec,
+    ProviderConfig,
     normalize_agent_name,
     resolve_execution_provider,
 )
@@ -152,6 +153,19 @@ def _sanitize_target(target: dict[str, Any]) -> dict[str, Any]:
         if key in sanitized:
             sanitized[key] = redact_sensitive_shell_value(sanitized[key])
     return sanitized
+
+
+def _provider_payload(provider: str | ProviderConfig | None) -> str | dict[str, Any] | None:
+    if not isinstance(provider, ProviderConfig):
+        return provider
+    # Preserve the existing inspect contract when optional capabilities are unset,
+    # including null values for older fields such as wire_api.
+    absent_capabilities = {
+        key
+        for key in ("model_reasoning", "model_context_window", "model_max_tokens")
+        if getattr(provider, key) is None
+    }
+    return provider.model_dump(mode="json", exclude=absent_capabilities)
 
 
 def _render_prompt_for_inspection(
@@ -1145,8 +1159,8 @@ def build_launch_inspection(
             "skills": list(node.skills),
             "mcps": [mcp.model_dump(mode="json") for mcp in node.mcps],
             "depends_on": list(node.depends_on),
-            "provider": node.provider.model_dump(mode="json") if hasattr(node.provider, "model_dump") else node.provider,
-            "resolved_provider": resolved_provider.model_dump(mode="json") if resolved_provider is not None else None,
+            "provider": _provider_payload(node.provider),
+            "resolved_provider": _provider_payload(resolved_provider),
             "target": _sanitize_target(execution_node.target.model_dump(mode="json")),
             "rendered_prompt": prompt,
             "rendered_prompt_preview": _preview_text(prompt, limit=120),
