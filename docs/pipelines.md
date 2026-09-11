@@ -308,6 +308,22 @@ idempotency keys. Built-in adapters reject `mode="native"` until an adapter has
 a tested native durable-goal lifecycle; AgentFlow does not simulate it with a
 prompt prefix.
 
+For local Pi nodes, supervised retries retain their transcripts under the
+node's `pi-sessions` runtime directory. A transcript of at least 2 MiB ending
+in `Upstream idle timeout exceeded` or `Provider finish_reason: error` can
+continue in a numbered `pi-sessions-recovery-N` directory. Small sessions,
+unknown errors, and sessions with a later healthy assistant response keep
+their current directory. Existing recovery directories are selected by number.
+
+Before preparing a local Pi attempt, AgentFlow checks every retained base and
+recovery transcript for the provider marker
+`Request blocked: prompt injection patterns detected`. Any occurrence stops
+preparation with a human-review error, even if a later timeout or healthy
+session exists. A session read failure also stops preparation. These checks
+preserve all transcript files; a timeout or new recovery directory cannot
+clear a policy rejection. This adapter check does not inspect transcripts on
+remote targets, whose existing session behavior is unchanged.
+
 Named `concurrency_pools` cap shared providers without reducing unrelated work:
 
 ```python
