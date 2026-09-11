@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 from agentflow.agents.util import PythonAdapter
 from agentflow.orchestrator import Orchestrator
@@ -89,3 +90,38 @@ def test_python_connector_node_cannot_import_from_untrusted_worktree(tmp_path: P
 
     assert json.loads(completed.stdout) == {"safe": True}
     assert not marker.exists()
+
+
+def _paths(tmp_path: Path) -> ExecutionPaths:
+    return ExecutionPaths(
+        host_workdir=tmp_path,
+        host_runtime_dir=tmp_path / "runtime",
+        target_workdir=str(tmp_path),
+        target_runtime_dir=str(tmp_path / "runtime"),
+        app_root=tmp_path,
+    )
+
+
+def test_python_node_defaults_to_python3_in_the_working_dir(tmp_path: Path):
+    node = NodeSpec.model_validate({"id": "collect", "agent": "python", "prompt": "print(1)"})
+
+    prepared = PythonAdapter().prepare(node, node.prompt, _paths(tmp_path))
+
+    assert prepared.command == ["python3", "-c", "print(1)"]
+    assert prepared.cwd == str(tmp_path)
+
+
+def test_python_node_honours_declared_executable_and_keeps_isolation_flag(tmp_path: Path):
+    node = NodeSpec.model_validate(
+        {
+            "id": "collect",
+            "agent": "python",
+            "prompt": "print(1)",
+            "executable": sys.executable,
+            "connector_bindings": [{"name": "bugdb", "url": "http://127.0.0.1:43210/mcp"}],
+        }
+    )
+
+    prepared = PythonAdapter().prepare(node, node.prompt, _paths(tmp_path))
+
+    assert prepared.command == [sys.executable, "-I", "-c", "print(1)"]

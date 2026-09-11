@@ -1,6 +1,9 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import json
+import os
+import time
 
 import pytest
 
@@ -199,3 +202,195 @@ def test_connector_success_requires_the_declared_connector(tmp_path: Path):
     result = NodeResult(node_id="hunt", current_attempt=1, trace_events=events)
 
     assert evaluate_success(node, result, tmp_path)[0] is False
+
+
+RANK_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["rankedFiles"],
+    "properties": {
+        "rankedFiles": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["path", "score"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "score": {"type": "integer", "minimum": 1, "maximum": 5},
+                },
+            },
+        }
+    },
+}
+
+
+def _schema_node(criteria: list[dict]) -> NodeSpec:
+    return NodeSpec.model_validate(
+        {"id": "rank", "agent": "codex", "prompt": "rank", "success_criteria": criteria}
+    )
+
+
+def _attempt_started_seconds_ago(seconds: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+
+
+def test_output_json_schema_validates_structured_output(tmp_path: Path):
+    node = _schema_node([{"kind": "output_json_schema", "schema": RANK_SCHEMA}])
+    result = NodeResult(
+        node_id="rank",
+        output="ignored when structured output is present",
+        structured_output={"rankedFiles": [{"path": "api.py", "score": 5}]},
+    )
+
+    assert evaluate_success(node, result, tmp_path) == (True, ["output_json_schema=True"])
+
+
+def test_output_json_schema_reparses_output_when_structured_output_is_missing(tmp_path: Path):
+    node = _schema_node([{"kind": "output_json_schema", "schema": RANK_SCHEMA}])
+    result = NodeResult(node_id="rank", output='Ranking complete.\n{"rankedFiles": []}')
+
+    assert evaluate_success(node, result, tmp_path) == (True, ["output_json_schema=True"])
+
+
+def test_output_json_schema_lists_every_schema_error(tmp_path: Path):
+    node = _schema_node([{"kind": "output_json_schema", "schema": RANK_SCHEMA}])
+    result = NodeResult(
+        node_id="rank",
+        structured_output={"rankedFiles": [{"path": 1, "score": 9}], "extra": True},
+    )
+
+    passed, messages = evaluate_success(node, result, tmp_path)
+
+    assert passed is False
+    assert messages == [
+        "output_json_schema=False: 3 error(s): "
+        "/: Additional properties are not allowed ('extra' was unexpected); "
+        "/rankedFiles/0/path: 1 is not of type 'string'; "
+        "/rankedFiles/0/score: 9 is greater than the maximum of 5"
+    ]
+
+
+def test_output_json_schema_reports_unparseable_output(tmp_path: Path):
+    node = _schema_node([{"kind": "output_json_schema", "schema": RANK_SCHEMA}])
+    result = NodeResult(node_id="rank", final_response="I could not finish the ranking.")
+
+    passed, messages = evaluate_success(node, result, tmp_path)
+
+    assert passed is False
+    assert messages == [
+        "output_json_schema=False: output is not valid JSON: Expecting value at line 1 column 1"
+    ]
+
+
+def test_file_json_schema_reads_runtime_and_workdir_roots(tmp_path: Path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / "plan.json").write_text('{"rankedFiles": []}', encoding="utf-8")
+    (tmp_path / "work.json").write_text('{"rankedFiles": [{"path": "a", "score": 1}]}', encoding="utf-8")
+    node = _schema_node(
+        [
+            {"kind": "file_json_schema", "path": "plan.json", "schema": RANK_SCHEMA},
+            {"kind": "file_json_schema", "path": "work.json", "schema": RANK_SCHEMA, "root": "workdir"},
+        ]
+    )
+
+    passed, messages = evaluate_success(
+        node,
+        NodeResult(node_id="rank"),
+        tmp_path,
+        runtime_dir=runtime,
+        attempt_started_at=_attempt_started_seconds_ago(5),
+    )
+
+    assert passed is True
+    assert messages == ["file_json_schema(plan.json)=True", "file_json_schema(work.json)=True"]
+
+
+def test_file_json_schema_rejects_stale_missing_and_invalid_files(tmp_path: Path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    stale = runtime / "stale.json"
+    stale.write_text('{"rankedFiles": []}', encoding="utf-8")
+    an_hour_ago = time.time() - 3600
+    os.utime(stale, (an_hour_ago, an_hour_ago))
+    (runtime / "broken.json").write_text("{not json", encoding="utf-8")
+    (runtime / "empty.json").write_text("\n", encoding="utf-8")
+    (runtime / "wrong.json").write_text('{"rankedFiles": "no"}', encoding="utf-8")
+    node = _schema_node(
+        [
+            {"kind": "file_json_schema", "path": "stale.json", "schema": RANK_SCHEMA},
+            {"kind": "file_json_schema", "path": "missing.json", "schema": RANK_SCHEMA},
+            {"kind": "file_json_schema", "path": "broken.json", "schema": RANK_SCHEMA},
+            {"kind": "file_json_schema", "path": "empty.json", "schema": RANK_SCHEMA},
+            {"kind": "file_json_schema", "path": "wrong.json", "schema": RANK_SCHEMA},
+        ]
+    )
+
+    passed, messages = evaluate_success(
+        node,
+        NodeResult(node_id="rank"),
+        tmp_path,
+        runtime_dir=runtime,
+        attempt_started_at=_attempt_started_seconds_ago(5),
+    )
+
+    assert passed is False
+    assert messages == [
+        "file_json_schema(stale.json)=False: file was not modified during this attempt",
+        "file_json_schema(missing.json)=False: file not found",
+        "file_json_schema(broken.json)=False: file is not valid JSON: "
+        "Expecting property name enclosed in double quotes at line 1 column 2",
+        "file_json_schema(empty.json)=False: file is empty",
+        "file_json_schema(wrong.json)=False: 1 error(s): /rankedFiles: 'no' is not of type 'array'",
+    ]
+
+
+def test_file_json_schema_can_accept_files_written_before_the_attempt(tmp_path: Path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    stale = runtime / "plan.json"
+    stale.write_text('{"rankedFiles": []}', encoding="utf-8")
+    an_hour_ago = time.time() - 3600
+    os.utime(stale, (an_hour_ago, an_hour_ago))
+    relaxed = _schema_node(
+        [{"kind": "file_json_schema", "path": "plan.json", "schema": RANK_SCHEMA, "modified_in_attempt": False}]
+    )
+    strict = _schema_node([{"kind": "file_json_schema", "path": "plan.json", "schema": RANK_SCHEMA}])
+
+    assert evaluate_success(
+        relaxed,
+        NodeResult(node_id="rank"),
+        tmp_path,
+        runtime_dir=runtime,
+        attempt_started_at=_attempt_started_seconds_ago(5),
+    ) == (True, ["file_json_schema(plan.json)=True"])
+    # Without an attempt timestamp there is nothing to compare against.
+    assert evaluate_success(strict, NodeResult(node_id="rank"), tmp_path, runtime_dir=runtime) == (
+        True,
+        ["file_json_schema(plan.json)=True"],
+    )
+
+
+def test_file_json_schema_needs_a_runtime_dir_for_the_runtime_root(tmp_path: Path):
+    node = _schema_node([{"kind": "file_json_schema", "path": "plan.json", "schema": RANK_SCHEMA}])
+
+    passed, messages = evaluate_success(node, NodeResult(node_id="rank"), tmp_path)
+
+    assert passed is False
+    assert messages == ["file_json_schema(plan.json)=False: runtime directory is unknown"]
+
+
+def test_json_schema_criteria_reject_invalid_schemas():
+    with pytest.raises(ValueError, match="output_json_schema schema is not a valid JSON Schema"):
+        _schema_node([{"kind": "output_json_schema", "schema": {"type": "nope"}}])
+    with pytest.raises(ValueError, match="file_json_schema schema is not a valid JSON Schema"):
+        _schema_node([{"kind": "file_json_schema", "path": "x.json", "schema": {"required": "id"}}])
+
+
+def test_json_schema_criteria_round_trip_through_persisted_node_specs():
+    node = _schema_node([{"kind": "output_json_schema", "schema": RANK_SCHEMA}])
+
+    assert node.success_criteria[0].json_schema == RANK_SCHEMA
+    assert node.model_dump(mode="json", by_alias=True)["success_criteria"][0]["schema"] == RANK_SCHEMA
+    reloaded = NodeSpec.model_validate(node.model_dump(mode="json"))
+    assert reloaded.success_criteria[0].json_schema == RANK_SCHEMA

@@ -16,6 +16,12 @@ from agentflow.utils import ensure_dir
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
+    """Write ``content`` to a sibling temp file and rename it over ``path``.
+
+    Node processes (collectors) read ``run.json`` and ``result.json`` while the
+    orchestrator rewrites them; the rename makes every read see a complete file.
+    """
+
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
         with temporary.open("x", encoding="utf-8") as handle:
@@ -219,7 +225,7 @@ class RunStore:
         ensure_dir(path.parent)
         lock = self._locks[run_id]
         with lock:
-            path.write_text(content, encoding="utf-8")
+            _atomic_write_text(path, content)
 
     async def write_artifact_json(self, run_id: str, node_id: str, name: str, payload: object) -> None:
         await self.write_artifact_text(run_id, node_id, name, json.dumps(payload, ensure_ascii=False, indent=2))
@@ -228,7 +234,7 @@ class RunStore:
         path = self.run_artifact_dir(run_id) / name
         lock = self._locks[run_id]
         with lock:
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
     def read_artifact_text(self, run_id: str, node_id: str, name: str) -> str:
         return self.artifact_path(run_id, node_id, name).read_text(encoding="utf-8")

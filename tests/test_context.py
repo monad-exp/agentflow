@@ -424,3 +424,69 @@ def test_render_node_prompt_can_use_artifact_paths_and_tick_metadata(tmp_path: P
 
     assert rendered.endswith("/run123/artifacts/worker_0/stdout.log")
     assert rendered.startswith("tick=1 ")
+
+
+def _run_context_pipeline(tmp_path: Path):
+    return load_pipeline_from_data(
+        {
+            "name": "run-context",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {"id": "plan", "agent": "codex", "prompt": "plan"},
+                {"id": "collect", "agent": "python", "prompt": "print(1)", "depends_on": ["plan"]},
+            ],
+        },
+        base_dir=tmp_path,
+    )
+
+
+def test_build_render_context_exposes_run_and_runtime_paths(tmp_path: Path):
+    pipeline = _run_context_pipeline(tmp_path)
+    results = {"plan": NodeResult(node_id="plan", status=NodeStatus.COMPLETED, output="{}")}
+    runs_dir = tmp_path / ".agentflow" / "runs"
+
+    context = build_render_context(
+        pipeline,
+        results,
+        current_node=pipeline.node_map["collect"],
+        run_id="run123",
+        artifacts_base_dir=runs_dir,
+    )
+
+    run_dir = runs_dir.resolve() / "run123"
+    assert context["run"] == {
+        "id": "run123",
+        "directory": str(run_dir),
+        "artifacts_directory": str(run_dir / "artifacts"),
+        "runtime_directory": str(run_dir / "runtime"),
+    }
+    assert context["nodes"]["plan"]["artifacts"]["runtime_dir"] == str(run_dir / "runtime" / "plan")
+    assert context["nodes"]["plan"]["artifacts"]["result_json"] == str(run_dir / "artifacts" / "plan" / "result.json")
+
+
+def test_build_render_context_omits_run_paths_without_a_run_identity(tmp_path: Path):
+    pipeline = _run_context_pipeline(tmp_path)
+    results = {"plan": NodeResult(node_id="plan", status=NodeStatus.COMPLETED, output="{}")}
+
+    context = build_render_context(pipeline, results, current_node=pipeline.node_map["collect"])
+
+    assert "run" not in context
+    assert "artifacts" not in context["nodes"]["plan"]
+
+
+def test_render_node_prompt_can_reference_run_paths(tmp_path: Path):
+    pipeline = _run_context_pipeline(tmp_path)
+    pipeline.node_map["collect"].prompt = "{{ run.id }} {{ run.runtime_directory }} {{ nodes.plan.artifacts.runtime_dir }}"
+    results = {"plan": NodeResult(node_id="plan", status=NodeStatus.COMPLETED, output="{}")}
+    runs_dir = tmp_path / ".agentflow" / "runs"
+
+    rendered = render_node_prompt(
+        pipeline,
+        pipeline.node_map["collect"],
+        results,
+        run_id="run123",
+        artifacts_base_dir=runs_dir,
+    )
+
+    run_dir = runs_dir.resolve() / "run123"
+    assert rendered == f"run123 {run_dir / 'runtime'} {run_dir / 'runtime' / 'plan'}"

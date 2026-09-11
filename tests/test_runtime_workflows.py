@@ -1561,3 +1561,259 @@ async def test_workflow_deadline_cancels_running_and_pending_nodes(tmp_path: Pat
         event.type == "run_deadline_exceeded"
         for event in orchestrator.store.get_events(completed.id)
     )
+
+
+RUN_IDENTITY_KEYS = (
+    "AGENTFLOW_RUN_ID",
+    "AGENTFLOW_RUN_DIR",
+    "AGENTFLOW_NODE_ID",
+    "AGENTFLOW_RUNTIME_DIR",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent", "code"),
+    [
+        (
+            "python",
+            "import json\n"
+            "from pathlib import Path\n"
+            "marker = Path('retry-marker')\n"
+            "count = 2 if marker.exists() else 'many'\n"
+            "marker.touch()\n"
+            "print(json.dumps({'count': count}))\n",
+        ),
+        (
+            "shell",
+            "if [ -f retry-marker ]; then\n"
+            "  printf '{\"count\": 2}\\n'\n"
+            "else\n"
+            "  touch retry-marker\n"
+            "  printf '{\"count\": \"many\"}\\n'\n"
+            "fi\n",
+        ),
+    ],
+    ids=["python", "shell"],
+)
+async def test_utility_retry_preserves_executable_source_after_schema_failure(
+    tmp_path: Path, agent: str, code: str
+):
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "utility-retry",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {
+                    "id": "collect",
+                    "agent": agent,
+                    "prompt": code,
+                    "retries": 1,
+                    "retry_backoff_seconds": 0,
+                    "success_criteria": [
+                        {
+                            "kind": "output_json_schema",
+                            "schema": {
+                                "type": "object",
+                                "required": ["count"],
+                                "properties": {"count": {"type": "integer"}},
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=10)
+
+    node = completed.nodes["collect"]
+    first, second = node.attempts
+    assert first.status == NodeStatus.FAILED
+    assert first.exit_code == 0
+    assert first.success is False
+    assert json.loads(first.output) == {"count": "many"}
+    assert second.status == NodeStatus.COMPLETED
+    assert second.exit_code == 0
+    assert second.success is True
+    assert json.loads(second.output) == {"count": 2}
+    assert completed.status == RunStatus.COMPLETED
+    assert node.stderr_lines == []
+
+
+@pytest.mark.asyncio
+async def test_retry_prompt_lists_only_the_failed_criteria_of_the_previous_attempt(tmp_path: Path):
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "retry-feedback",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {
+                    "id": "rank",
+                    "agent": "codex",
+                    "prompt": '{"count": "many"}',
+                    "retries": 1,
+                    "retry_backoff_seconds": 0,
+                    "success_criteria": [
+                        {"kind": "output_contains", "value": "count"},
+                        {
+                            "kind": "output_json_schema",
+                            "schema": {
+                                "type": "object",
+                                "required": ["count"],
+                                "properties": {"count": {"type": "integer"}},
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=10)
+
+    node = completed.nodes["rank"]
+    assert node.status == NodeStatus.FAILED
+    first, second = node.attempts
+    assert first.success is False
+    assert first.success_details == [
+        "output_contains('count')=True",
+        "output_json_schema=False: 1 error(s): /count: 'many' is not of type 'integer'",
+    ]
+    # The mock adapter echoes its prompt, so the second output is the retry prompt.
+    assert second.output == (
+        '{"count": "many"}'
+        "\n\nAgentFlow previous attempt did not meet its success criteria:"
+        "\n- output_json_schema=False: 1 error(s): /count: 'many' is not of type 'integer'"
+    )
+    assert "=True" not in second.output.split("did not meet", 1)[1]
+
+
+@pytest.mark.asyncio
+async def test_recovered_attempt_after_a_cancelled_one_gets_no_retry_feedback(tmp_path: Path):
+    orchestrator = _orchestrator(tmp_path)
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "recovery-no-feedback",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {
+                    "id": "rank",
+                    "agent": "codex",
+                    "prompt": '{"count": 2}',
+                    "retries": 1,
+                    "retry_backoff_seconds": 0,
+                    "success_criteria": [{"kind": "output_json_schema", "schema": {"type": "object"}}],
+                }
+            ],
+        }
+    )
+    # Process recovery evaluates a mid-flight attempt on its partial output before
+    # cancelling it, so the interrupted attempt carries a failed criterion.
+    interrupted = NodeAttempt(
+        number=1,
+        status=NodeStatus.RUNNING,
+        started_at="2026-01-01T00:00:00+00:00",
+        success=False,
+        success_details=["output_json_schema=False: output is empty"],
+    )
+    record = RunRecord(
+        id="recover-1",
+        status=RunStatus.RUNNING,
+        pipeline=pipeline,
+        declared_pipeline=pipeline,
+        nodes={"rank": NodeResult(node_id="rank", status=NodeStatus.RUNNING, attempts=[interrupted])},
+    )
+    await orchestrator.store.create_run(record)
+
+    recovered = await orchestrator.recover("recover-1")
+    completed = await orchestrator.wait(recovered.id, timeout=10)
+
+    node = completed.nodes["rank"]
+    assert node.status == NodeStatus.COMPLETED
+    first, second = node.attempts
+    assert (first.number, first.status) == (1, NodeStatus.CANCELLED)
+    assert second.number == 2
+    # The mock adapter echoes its prompt: the recovered attempt is not a retry.
+    assert second.output == '{"count": 2}'
+    assert "did not meet its success criteria" not in second.output
+
+
+@pytest.mark.asyncio
+async def test_nodes_receive_run_identity_environment_without_mutating_the_spec(tmp_path: Path):
+    orchestrator = _orchestrator(tmp_path)
+    code = (
+        "import json, os\n"
+        f"print(json.dumps({{key: os.environ.get(key) for key in {list(RUN_IDENTITY_KEYS)!r}}}))\n"
+    )
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "run-identity-env",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {
+                    "id": "collect",
+                    "agent": "python",
+                    "prompt": code,
+                    "env": {"AGENTFLOW_NODE_ID": "spoofed", "KEEP_ME": "1"},
+                }
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=10)
+
+    assert completed.status == RunStatus.COMPLETED
+    run_dir = orchestrator.store.run_dir(completed.id).resolve()
+    assert completed.nodes["collect"].structured_output == {
+        "AGENTFLOW_RUN_ID": completed.id,
+        "AGENTFLOW_RUN_DIR": str(run_dir),
+        "AGENTFLOW_NODE_ID": "collect",
+        "AGENTFLOW_RUNTIME_DIR": str(run_dir / "runtime" / "collect"),
+    }
+    assert completed.pipeline.node_map["collect"].env == {"AGENTFLOW_NODE_ID": "spoofed", "KEEP_ME": "1"}
+    launch = json.loads((run_dir / "artifacts" / "collect" / "launch.json").read_text(encoding="utf-8"))
+    assert launch["env"]["AGENTFLOW_NODE_ID"] == "collect"
+
+
+@pytest.mark.asyncio
+async def test_resume_copies_runtime_directories_of_completed_nodes(tmp_path: Path):
+    orchestrator = _orchestrator(tmp_path)
+    code = (
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "runtime = Path(os.environ['AGENTFLOW_RUNTIME_DIR'])\n"
+        "(runtime / 'state.json').write_text(json.dumps({'cursor': 7}), encoding='utf-8')\n"
+        "print(json.dumps({'ok': True}))\n"
+    )
+    pipeline = PipelineSpec.model_validate(
+        {
+            "name": "resume-runtime",
+            "working_dir": str(tmp_path),
+            "nodes": [
+                {"id": "collect", "agent": "python", "prompt": code},
+                {"id": "fail_always", "agent": "codex", "prompt": "boom", "depends_on": ["collect"]},
+            ],
+        }
+    )
+
+    submitted = await orchestrator.submit(pipeline)
+    failed = await orchestrator.wait(submitted.id, timeout=10)
+    assert failed.status == RunStatus.FAILED
+    assert failed.nodes["collect"].status == NodeStatus.COMPLETED
+
+    resumed = await orchestrator.resume(failed.id)
+    new_run_dir = orchestrator.store.run_dir(resumed.id)
+    state = new_run_dir / "runtime" / "collect" / "state.json"
+    assert json.loads(state.read_text(encoding="utf-8")) == {"cursor": 7}
+    assert (new_run_dir / "artifacts" / "collect" / "result.json").is_file()
+    assert not (new_run_dir / "runtime" / "fail_always").exists()
+
+    finished = await orchestrator.wait(resumed.id, timeout=10)
+    assert finished.nodes["collect"].status == NodeStatus.COMPLETED
+    assert finished.nodes["collect"].structured_output == {"ok": True}

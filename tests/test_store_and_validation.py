@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -116,6 +117,54 @@ async def test_store_loads_bounded_trace_history_and_preserves_lifecycle_events(
         "run_completed",
     ]
     assert [event.data["index"] for event in events if event.type == "node_trace"] == [3, 4]
+
+
+@pytest.mark.asyncio
+async def test_store_replaces_run_json_and_artifacts_atomically(tmp_path, monkeypatch):
+    import os
+
+    from agentflow import store as store_module
+
+    store = RunStore(tmp_path / "runs")
+    pipeline = PipelineSpec.model_validate(
+        {"name": "atomic", "working_dir": str(tmp_path), "nodes": [{"id": "a", "agent": "codex", "prompt": "p"}]}
+    )
+    record = RunRecord(id="run-a", status="queued", pipeline=pipeline, nodes={"a": NodeResult(node_id="a")})
+    await store.create_run(record)
+    await store.write_artifact_json("run-a", "a", "result.json", {"structured_output": {"ok": True}})
+    await store.write_run_artifact_json("run-a", "source-snapshot.json", {"commit": "abc"})
+    run_dir = store.run_dir("run-a")
+    assert RunRecord.model_validate_json((run_dir / "run.json").read_text(encoding="utf-8")).id == "run-a"
+    assert json.loads(store.read_artifact_text("run-a", "a", "result.json")) == {"structured_output": {"ok": True}}
+    assert not list(run_dir.rglob("*.tmp"))
+
+    # Content reaches the destination only through a rename of a completed temp file.
+    replaced: list[tuple[str, str]] = []
+
+    def observing_replace(src, dst):
+        assert Path(src).parent == Path(dst).parent
+        assert Path(src) != Path(dst)
+        assert Path(src).read_text(encoding="utf-8").endswith("}")
+        replaced.append((Path(src).name, Path(dst).name))
+        os.rename(src, dst)
+
+    monkeypatch.setattr(store_module.os, "replace", observing_replace)
+    await store.persist_run("run-a")
+    await store.write_artifact_json("run-a", "a", "result.json", {"structured_output": {"ok": False}})
+    await store.write_run_artifact_json("run-a", "source-snapshot.json", {"commit": "def"})
+    assert [dst for _, dst in replaced] == ["run.json", "result.json", "source-snapshot.json"]
+    assert not list(run_dir.rglob("*.tmp"))
+    assert json.loads(store.read_artifact_text("run-a", "a", "result.json")) == {"structured_output": {"ok": False}}
+
+    # A failed rename leaves the previous file intact and no temp file behind.
+    def failing_replace(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store_module.os, "replace", failing_replace)
+    with pytest.raises(OSError, match="disk full"):
+        await store.write_artifact_json("run-a", "a", "result.json", {"structured_output": "torn"})
+    assert json.loads(store.read_artifact_text("run-a", "a", "result.json")) == {"structured_output": {"ok": False}}
+    assert not list(run_dir.rglob("*.tmp"))
 
 
 @pytest.mark.asyncio
