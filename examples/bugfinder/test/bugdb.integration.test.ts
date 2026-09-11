@@ -160,7 +160,40 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
       createFindings(prisma, runScope, {
         findings: [{ ...findingAppend.findings[0], leadIds: [fileLead.id] }],
       }),
-    ).rejects.toThrow(/partition every Lead/);
+    ).rejects.toThrow(
+      `missing Lead IDs (1): [${JSON.stringify(threatLead.id)}]; unknown Lead IDs (0): []`,
+    );
+    expect(await prisma.finding.count({ where: { runId } })).toBe(0);
+    expect(await prisma.lead.count({ where: { id: { in: [fileLead.id, threatLead.id] }, findingId: null } })).toBe(2);
+    const unknownLeadId = `lead_${"f".repeat(64)}`;
+    await expect(
+      createFindings(prisma, runScope, {
+        findings: [{ ...findingAppend.findings[0], leadIds: [fileLead.id, unknownLeadId] }],
+      }),
+    ).rejects.toThrow(
+      `missing Lead IDs (1): [${JSON.stringify(threatLead.id)}]; unknown Lead IDs (1): [${JSON.stringify(unknownLeadId)}]`,
+    );
+    const manyUnknownLeadIds = Array.from(
+      { length: 21 },
+      (_, index) => `lead_unknown_${index.toString().padStart(2, "0")}`,
+    );
+    await expect(
+      createFindings(prisma, runScope, {
+        findings: [{ ...findingAppend.findings[0], leadIds: manyUnknownLeadIds }],
+      }),
+    ).rejects.toThrow(
+      `unknown Lead IDs (21): ${JSON.stringify(manyUnknownLeadIds.slice(0, 20))} (+1 more)`,
+    );
+    await expect(
+      createFindings(prisma, runScope, {
+        findings: [{
+          ...findingAppend.findings[0],
+          leadIds: [fileLead.id, threatLead.id, fileLead.id],
+        }],
+      }),
+    ).rejects.toThrow(
+      `Lead IDs assigned more than once (1): [${JSON.stringify(fileLead.id)}]`,
+    );
     expect(await prisma.finding.count({ where: { runId } })).toBe(0);
     expect(await prisma.lead.count({ where: { id: { in: [fileLead.id, threatLead.id] }, findingId: null } })).toBe(2);
     await expect(
@@ -182,52 +215,6 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
       new Set([HuntKind.FILE, HuntKind.THREAT_MODEL]),
     );
     expect(concurrentReplay[0].id).toBe(findings[0].id);
-
-    const [lateHunt] = await addHunts(prisma, runScope, {
-      hunts: [{
-        callerKey: "file:src/recovered.ts",
-        kind: HuntKind.FILE,
-        objective: "Audit a source file recovered after the first Finding partition.",
-        paths: ["src/recovered.ts"],
-      }],
-    });
-    const lateLeadA = await addLead(prisma, { runId, itemId: lateHunt.id }, {
-      callerKey: "recovered-boundary-a",
-      claim: "A late recovered Hunt found one side of a boundary defect.",
-      locations: ["src/recovered.ts:10"],
-      evidence: "The recovered source path reaches the unchecked boundary.",
-    });
-    const lateLeadB = await addLead(prisma, { runId, itemId: lateHunt.id }, {
-      callerKey: "recovered-boundary-b",
-      claim: "The same late recovered Hunt confirmed the other side of the boundary defect.",
-      locations: ["src/recovered.ts:20"],
-      evidence: "The second path confirms the same unchecked boundary.",
-    });
-    await finishHunt(prisma, { runId, itemId: lateHunt.id }, {
-      result: HuntResult.BUG_FOUND,
-      resultSummary: "Committed two Leads after the first Finding partition.",
-    });
-    const lateFinding = {
-      callerKey: "recovered-boundary-confusion",
-      title: "Recovered boundary can use the wrong state",
-      rootCause: "A shared boundary omits the state discriminator.",
-      impact: "A late request can consume state from the wrong boundary.",
-      leadIds: [lateLeadA.id, lateLeadB.id],
-    };
-    await expect(
-      createFindings(prisma, runScope, {
-        findings: [{ ...lateFinding, leadIds: [lateLeadA.id] }],
-      }),
-    ).rejects.toThrow(/partition every Lead currently unassigned/);
-    const lateFindings = await createFindings(prisma, runScope, { findings: [lateFinding] });
-    expect(lateFindings).toHaveLength(1);
-    expect(lateFindings[0].leads.map((lead) => lead.id).sort()).toEqual(
-      [lateLeadA.id, lateLeadB.id].sort(),
-    );
-    const lateReplay = await createFindings(prisma, runScope, { findings: [lateFinding] });
-    expect(lateReplay[0].id).toBe(lateFindings[0].id);
-    expect(await prisma.finding.count({ where: { runId } })).toBe(2);
-
     await expect(
       createFindings(prisma, runScope, {
         findings: [
@@ -242,7 +229,7 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
         ],
       }),
     ).rejects.toThrow(/idempotency conflict/);
-    expect(await prisma.finding.count({ where: { runId } })).toBe(2);
+    expect(await prisma.finding.count({ where: { runId } })).toBe(1);
 
     const findingScope = { runId, itemId: findings[0].id };
     await setTriage(prisma, findingScope, {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 from collections import defaultdict, deque
@@ -12,6 +13,16 @@ from pydantic import ValidationError
 from agentflow.output_capture import RETAINED_RUN_TRACE_EVENTS_MAX_COUNT
 from agentflow.specs import RunEvent, RunRecord
 from agentflow.utils import ensure_dir
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class RunStore:
@@ -118,9 +129,9 @@ class RunStore:
         run_dir = self.run_dir(run_id)
         lock = self._locks[run_id]
         with lock:
-            (run_dir / "run.json").write_text(
+            _atomic_write_text(
+                run_dir / "run.json",
                 record.model_dump_json(indent=2),
-                encoding="utf-8",
             )
 
     async def append_event(self, run_id: str, event: RunEvent) -> None:
