@@ -72,6 +72,26 @@ function sameStringSet(left: string[], right: string[]): boolean {
   return sameStrings([...left].sort(), [...right].sort());
 }
 
+const MAX_DIAGNOSTIC_LEAD_IDS = 20;
+
+function repeatedStrings(values: string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+  return [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([value]) => value)
+    .sort();
+}
+
+function leadIdDiagnostic(label: string, values: string[]): string {
+  const ids = [...new Set(values)].sort();
+  const displayed = ids.slice(0, MAX_DIAGNOSTIC_LEAD_IDS);
+  const omitted = ids.length - displayed.length;
+  return `${label} (${ids.length}): ${JSON.stringify(displayed)}${
+    omitted > 0 ? ` (+${omitted} more)` : ""
+  }`;
+}
+
 function requireItem(scope: BugDbScope, kind: "Hunt" | "Finding"): string {
   if (!scope.itemId) throw new Error(`${kind} scope was not injected by AgentFlow`);
   return scope.itemId;
@@ -265,15 +285,25 @@ export async function createFindings(
     throw new Error("Finding caller keys must be unique within one request");
   }
   const allLeadIds = input.findings.flatMap((finding) => finding.leadIds);
-  if (new Set(allLeadIds).size !== allLeadIds.length) {
-    throw new Error("a Lead may appear in only one Finding append");
+  const duplicateLeadIds = repeatedStrings(allLeadIds);
+  if (duplicateLeadIds.length > 0) {
+    throw new Error(leadIdDiagnostic("Lead IDs assigned more than once", duplicateLeadIds));
   }
   const commit = async () => prisma.$transaction(async (tx) => {
     const leads = await tx.lead.findMany({
       where: { hunt: { runId: scope.runId } },
     });
-    if (!sameStringSet(leads.map((lead) => lead.id), allLeadIds)) {
-      throw new Error("Finding input must partition every Lead in this AgentFlow run exactly once");
+    const durableLeadIds = leads.map((lead) => lead.id);
+    if (!sameStringSet(durableLeadIds, allLeadIds)) {
+      const durableLeadIdSet = new Set(durableLeadIds);
+      const submittedLeadIdSet = new Set(allLeadIds);
+      const missingLeadIds = durableLeadIds.filter((id) => !submittedLeadIdSet.has(id));
+      const unknownLeadIds = allLeadIds.filter((id) => !durableLeadIdSet.has(id));
+      throw new Error(
+        "Finding input must partition every Lead in this AgentFlow run exactly once; " +
+        `${leadIdDiagnostic("missing Lead IDs", missingLeadIds)}; ` +
+        leadIdDiagnostic("unknown Lead IDs", unknownLeadIds),
+      );
     }
     for (const [index, finding] of input.findings.entries()) {
       const id = ids[index];
