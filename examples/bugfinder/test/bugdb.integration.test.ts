@@ -259,6 +259,78 @@ describe.skipIf(!databaseUrl)("append-constrained BugDB tools", () => {
     ).rejects.toThrow(/already set/);
   });
 
+  test.each([false, true])("appends late Leads with complete replay membership (includeExisting=%s)", async (includeExisting) => {
+    const appendRunId = `append-${randomUUID()}`;
+    const appendScope = { runId: appendRunId };
+    const addBatch = async (batch: string) => {
+      const [hunt] = await addHunts(prisma, appendScope, {
+        hunts: [{ callerKey: batch, kind: HuntKind.FILE, objective: `Inspect ${batch}`, paths: [`${batch}.ts`] }],
+      });
+      const huntScope = { ...appendScope, itemId: hunt.id };
+      const leads = await Promise.all(["a", "b"].map((key) => addLead(prisma, huntScope, {
+        callerKey: key,
+        claim: `${batch} observation ${key}`,
+        locations: [`${batch}.ts:1`],
+        evidence: `Fixture evidence ${key}`,
+      })));
+      await finishHunt(prisma, huntScope, { result: HuntResult.BUG_FOUND, resultSummary: "Two observations recorded" });
+      return {
+        callerKey: batch,
+        title: `${batch} record`,
+        rootCause: `${batch} shared cause`,
+        impact: `${batch} result`,
+        leadIds: leads.map((lead) => lead.id),
+      };
+    };
+    const existingInput = await addBatch("initial");
+    const [existing] = await createFindings(prisma, appendScope, { findings: [existingInput] });
+    const lateInput = await addBatch("late");
+    const assertUnchanged = async () => {
+      expect(await prisma.finding.count({ where: { runId: appendRunId } })).toBe(1);
+      expect(await prisma.lead.count({ where: { id: { in: lateInput.leadIds }, findingId: null } })).toBe(2);
+      expect(await prisma.lead.count({ where: { id: { in: existingInput.leadIds }, findingId: existing.id } })).toBe(2);
+    };
+    const replayInputs = includeExisting ? [existingInput] : [];
+    await expect(createFindings(prisma, appendScope, {
+      findings: [...replayInputs, { ...lateInput, leadIds: [lateInput.leadIds[0]] }],
+    })).rejects.toThrow(
+      `missing Lead IDs (1): [${JSON.stringify(lateInput.leadIds[1])}]; unknown Lead IDs (0): []`,
+    );
+    await assertUnchanged();
+
+    // Replaying an old Finding must not silently omit newly unassigned Leads.
+    await expect(createFindings(prisma, appendScope, { findings: [existingInput] })).rejects.toThrow(
+      `missing Lead IDs (2): ${JSON.stringify([...lateInput.leadIds].sort())}; unknown Lead IDs (0): []`,
+    );
+    await assertUnchanged();
+
+    // An explicitly replayed Finding must keep all its durable members.
+    await expect(createFindings(prisma, appendScope, {
+      findings: [{ ...existingInput, leadIds: [existingInput.leadIds[0]] }, lateInput],
+    })).rejects.toThrow(
+      `missing Lead IDs (1): [${JSON.stringify(existingInput.leadIds[1])}]; unknown Lead IDs (0): []`,
+    );
+    await assertUnchanged();
+
+    await expect(createFindings(prisma, appendScope, {
+      findings: [{ ...lateInput, leadIds: [...lateInput.leadIds, existingInput.leadIds[0]] }],
+    })).rejects.toThrow(
+      `Lead IDs already assigned to another Finding (1): [${JSON.stringify(existingInput.leadIds[0])}]`,
+    );
+    await assertUnchanged();
+
+    const appended = await createFindings(prisma, appendScope, { findings: [...replayInputs, lateInput] });
+    expect(appended).toHaveLength(includeExisting ? 2 : 1);
+    const late = appended.at(-1)!;
+    expect(late.leads.map((lead) => lead.id).sort()).toEqual([...lateInput.leadIds].sort());
+    const replay = await createFindings(prisma, appendScope, { findings: [lateInput, existingInput] });
+    expect(replay.map((finding) => finding.id)).toEqual([late.id, existing.id]);
+    const [isolatedReplay] = await createFindings(prisma, appendScope, { findings: [existingInput] });
+    expect(isolatedReplay.id).toBe(existing.id);
+    expect(await prisma.finding.count({ where: { runId: appendRunId } })).toBe(2);
+    expect(await prisma.lead.count({ where: { hunt: { runId: appendRunId }, findingId: null } })).toBe(0);
+  });
+
   test("the app role cannot mutate canonical fields and the schema contains no JSON", async () => {
     const privilegeRunId = `privilege-${randomUUID()}`;
     const [hunt] = await addHunts(prisma, { runId: privilegeRunId }, {
