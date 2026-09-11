@@ -568,6 +568,231 @@ def test_pi_adapter_resumes_node_scoped_session_for_supervised_durable_goal(tmp_
     assert prepared.command[session_dir_index + 1] == str(tmp_path / ".runtime" / "pi-sessions")
 
 
+def _durable_pi_node():
+    return NodeSpec.model_validate(
+        {
+            "id": "review",
+            "agent": "pi",
+            "prompt": "Review the input.",
+            "durable_goal": {"mode": "supervised"},
+        }
+    )
+
+
+def _pi_assistant_message(error=None):
+    return json.dumps(
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "stopReason": "error" if error is not None else "stop",
+                "errorMessage": error,
+            },
+        }
+    ) + "\n"
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        "Request blocked: prompt injection patterns detected\n",
+        _pi_assistant_message("Request blocked: prompt injection patterns detected"),
+        _pi_assistant_message(
+            "Upstream idle timeout exceeded; Request blocked: prompt injection patterns detected"
+        ),
+        _pi_assistant_message("Request blocked: prompt injection patterns detected")
+        + _pi_assistant_message(),
+        _pi_assistant_message("Request blocked: prompt injection patterns detected")
+        + "x" * (2 * 1024 * 1024)
+        + "\n"
+        + _pi_assistant_message("Upstream idle timeout exceeded"),
+    ],
+    ids=["plain", "structured", "timeout", "later-healthy", "outside-tail"],
+)
+def test_pi_adapter_requires_human_review_for_retained_policy_rejection(tmp_path, history):
+    session_dir = tmp_path / ".runtime" / "pi-sessions"
+    session_dir.mkdir(parents=True)
+    transcript = session_dir / "rejected.jsonl"
+    transcript.write_text(history, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="safety-filter rejection; human review is required"):
+        PiAdapter().prepare(_durable_pi_node(), "Review the input.", _paths(tmp_path))
+
+    assert transcript.read_text(encoding="utf-8") == history
+    assert list(session_dir.parent.iterdir()) == [session_dir]
+
+
+@pytest.mark.parametrize("newer_location", ["pi-sessions", "pi-sessions-recovery-1"])
+def test_pi_adapter_does_not_skip_rejection_when_newer_history_is_healthy(tmp_path, newer_location):
+    session_dir = tmp_path / ".runtime" / "pi-sessions"
+    session_dir.mkdir(parents=True)
+    rejected = session_dir / "rejected.jsonl"
+    rejected.write_text(
+        _pi_assistant_message("Request blocked: prompt injection patterns detected"),
+        encoding="utf-8",
+    )
+    newer_dir = session_dir.parent / newer_location
+    newer_dir.mkdir(exist_ok=True)
+    healthy = newer_dir / "healthy.jsonl"
+    healthy.write_text(_pi_assistant_message(), encoding="utf-8")
+    before = {path: path.read_bytes() for path in session_dir.parent.rglob("*.jsonl")}
+
+    with pytest.raises(ValueError, match="human review is required"):
+        PiAdapter().prepare(_durable_pi_node(), "Review the input.", _paths(tmp_path))
+
+    assert {path: path.read_bytes() for path in session_dir.parent.rglob("*.jsonl")} == before
+
+
+@pytest.mark.parametrize(
+    ("size", "error", "healthy_response", "expected_dir"),
+    [
+        (2 * 1024 * 1024, "Upstream idle timeout exceeded", False, "pi-sessions-recovery-1"),
+        (2 * 1024 * 1024, "Provider finish_reason: error", False, "pi-sessions-recovery-1"),
+        (0, "Upstream idle timeout exceeded", False, "pi-sessions"),
+        (2 * 1024 * 1024, "Upstream idle timeout exceeded", True, "pi-sessions"),
+        (2 * 1024 * 1024, "Unknown error", False, "pi-sessions"),
+    ],
+    ids=["large-timeout", "large-provider-error", "small-timeout", "later-healthy", "unknown-error"],
+)
+def test_pi_adapter_recovers_only_large_sessions_ending_in_transient_error(
+    tmp_path, size, error, healthy_response, expected_dir
+):
+    session_dir = tmp_path / ".runtime" / "pi-sessions"
+    session_dir.mkdir(parents=True)
+    transcript = session_dir / "session.jsonl"
+    history = "x" * size + "\n" + _pi_assistant_message(error)
+    if healthy_response:
+        history += _pi_assistant_message()
+    transcript.write_text(history, encoding="utf-8")
+
+    prepared = PiAdapter().prepare(_durable_pi_node(), "Review the input.", _paths(tmp_path))
+
+    assert prepared.command[prepared.command.index("--session-dir") + 1] == str(
+        session_dir.parent / expected_dir
+    )
+    assert transcript.read_text(encoding="utf-8") == history
+    assert list(session_dir.parent.iterdir()) == [session_dir]
+
+
+def test_pi_adapter_continues_latest_numbered_recovery_after_transient_failure(tmp_path):
+    runtime_dir = tmp_path / ".runtime"
+    for directory in ["pi-sessions", "pi-sessions-recovery-2", "pi-sessions-recovery-10"]:
+        session_dir = runtime_dir / directory
+        session_dir.mkdir(parents=True)
+        (session_dir / "session.jsonl").write_text(_pi_assistant_message(), encoding="utf-8")
+    # Non-ASCII digit-like names must not cause int() to raise during discovery.
+    (runtime_dir / "pi-sessions-recovery-²").mkdir()
+
+    prepared = PiAdapter().prepare(_durable_pi_node(), "Review the input.", _paths(tmp_path))
+
+    assert prepared.command[prepared.command.index("--session-dir") + 1] == str(
+        runtime_dir / "pi-sessions-recovery-10"
+    )
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "not JSON", "null", "[]", '"text"', "42", '{"type":"message","message":[]}',
+        "1" * 5000, "[" * 2000 + "]" * 2000,
+    ],
+    ids=["text", "null", "list", "string", "number", "nonobject-message", "huge-number", "deep-array"],
+)
+def test_pi_session_parser_tolerates_malformed_or_nonobject_records(record):
+    history = _pi_assistant_message("Upstream idle timeout exceeded") + record + "\n"
+    assert PiAdapter._latest_assistant_error(history) == "Upstream idle timeout exceeded"
+
+
+def test_pi_session_parser_does_not_treat_nonstring_error_as_transient():
+    assert PiAdapter._latest_assistant_error(_pi_assistant_message([])) == ""
+
+
+@pytest.mark.parametrize(
+    "record", [json.dumps("Upstream idle timeout exceeded"), json.dumps(["Upstream idle timeout exceeded"])]
+)
+def test_pi_session_parser_does_not_treat_nonmessage_json_as_plain_error(record):
+    assert PiAdapter._latest_assistant_error(record) == ""
+
+
+def test_pi_session_parser_recognizes_legacy_plain_text_terminal_error():
+    assert PiAdapter._latest_assistant_error("Upstream idle timeout exceeded\n") == (
+        "Upstream idle timeout exceeded"
+    )
+
+
+def test_pi_adapter_fails_closed_when_session_cannot_be_read(tmp_path, monkeypatch):
+    session_dir = tmp_path / ".runtime" / "pi-sessions"
+    session_dir.mkdir(parents=True)
+    transcript = session_dir / "session.jsonl"
+    transcript.write_text(_pi_assistant_message(), encoding="utf-8")
+    original_open = Path.open
+
+    def unreadable(path, *args, **kwargs):
+        if path == transcript:
+            raise PermissionError("inert fixture")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", unreadable)
+    with pytest.raises(ValueError, match="Cannot inspect Pi session history; human review"):
+        PiAdapter().prepare(_durable_pi_node(), "Review the input.", _paths(tmp_path))
+
+
+@pytest.mark.parametrize("unreadable_dir", ["", "pi-sessions"])
+def test_pi_adapter_fails_closed_when_history_directory_cannot_be_listed(
+    tmp_path, monkeypatch, unreadable_dir
+):
+    runtime_dir = tmp_path / ".runtime"
+    session_dir = runtime_dir / "pi-sessions"
+    session_dir.mkdir(parents=True)
+    original_iterdir = Path.iterdir
+
+    def unreadable(path):
+        if path == runtime_dir / unreadable_dir:
+            raise PermissionError("inert fixture")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", unreadable)
+    with pytest.raises(ValueError, match="Cannot inspect Pi session history; human review"):
+        PiAdapter().prepare(_durable_pi_node(), "Review the input.", _paths(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_pi_policy_rejection_stops_retry_before_another_runner_launch(tmp_path):
+    from agentflow.orchestrator import Orchestrator
+    from agentflow.runners.base import RawExecutionResult, Runner
+    from agentflow.runners.registry import RunnerRegistry
+    from agentflow.specs import PipelineSpec, RunStatus
+    from agentflow.store import RunStore
+
+    class RejectedSessionRunner(Runner):
+        calls = 0
+
+        async def execute(self, node, prepared, paths, on_output, should_cancel):
+            self.calls += 1
+            session_dir = Path(prepared.command[prepared.command.index("--session-dir") + 1])
+            session_dir.mkdir(parents=True, exist_ok=True)
+            (session_dir / "rejected.jsonl").write_text(
+                _pi_assistant_message("Request blocked: prompt injection patterns detected"),
+                encoding="utf-8",
+            )
+            return RawExecutionResult(exit_code=1)
+
+    runner = RejectedSessionRunner()
+    runners = RunnerRegistry()
+    runners.register("local", runner)
+    orchestrator = Orchestrator(store=RunStore(tmp_path / "runs"), runners=runners)
+    node = _durable_pi_node().model_copy(update={"retries": 2, "retry_backoff_seconds": 0})
+    pipeline = PipelineSpec(name="policy-stop", working_dir=str(tmp_path), nodes=[node])
+
+    submitted = await orchestrator.submit(pipeline)
+    completed = await orchestrator.wait(submitted.id, timeout=5)
+
+    assert completed.status == RunStatus.FAILED
+    assert runner.calls == 1
+    assert "human review is required" in completed.nodes["review"].success_details[0]
+    assert not list(orchestrator.store.run_dir(completed.id).rglob("pi-sessions-recovery-*"))
+
+
 def test_pi_adapter_read_only_tool_mapping(tmp_path):
     node = NodeSpec.model_validate(
         {"id": "scan", "agent": "pi", "prompt": "Scan", "tools": "read_only"}

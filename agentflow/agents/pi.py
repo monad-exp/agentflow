@@ -11,6 +11,13 @@ from agentflow.specs import NodeSpec, ProviderConfig, RepoInstructionsMode, Tool
 
 _PI_READ_ONLY_TOOLS = "read,grep,find,ls"
 _PI_READ_WRITE_TOOLS = "read,bash,edit,write,grep,find,ls"
+_PI_POLICY_REJECTION = b"Request blocked: prompt injection patterns detected"
+_PI_TRANSIENT_SESSION_ERRORS = (
+    "Upstream idle timeout exceeded",
+    "Provider finish_reason: error",
+)
+_PI_SESSION_ERROR_SCAN_BYTES = 256 * 1024
+_PI_SESSION_ROLLOVER_MIN_BYTES = 2 * 1024 * 1024
 
 
 class PiAdapter(AgentAdapter):
@@ -37,11 +44,15 @@ class PiAdapter(AgentAdapter):
         ]
         if node.durable_goal is not None and node.durable_goal.mode == "supervised":
             # Keep each durable node's Pi history alongside its other runtime
-            # state. --continue creates a session when none exists and resumes
-            # the most recent one on retries or process-level recovery.
+            # state. Inspect retained local history before resuming; only large
+            # sessions ending in transient errors may use a recovery directory.
+            runtime_dir = Path(paths.target_runtime_dir)
+            session_dir = runtime_dir / "pi-sessions"
+            if node.target.kind == "local":
+                session_dir = self._durable_session_dir(runtime_dir)
             command.extend([
                 "--session-dir",
-                str(Path(paths.target_runtime_dir) / "pi-sessions"),
+                str(session_dir),
                 "--continue",
             ])
         else:
@@ -106,6 +117,108 @@ class PiAdapter(AgentAdapter):
             runtime_files=runtime_files,
             stdin=prompt,
         )
+
+    @classmethod
+    def _durable_session_dir(cls, runtime_dir: Path) -> Path:
+        base = runtime_dir / "pi-sessions"
+        try:
+            directories = list(runtime_dir.iterdir()) if runtime_dir.exists() else []
+            recovery_dirs = sorted(
+                (
+                    path
+                    for path in directories
+                    if path.name.startswith("pi-sessions-recovery-")
+                    and path.is_dir()
+                    and (suffix := path.name.removeprefix("pi-sessions-recovery-")).isascii()
+                    and suffix.isdecimal()
+                ),
+                key=lambda path: int(path.name.removeprefix("pi-sessions-recovery-")),
+            )
+        except OSError as exc:
+            raise ValueError(
+                "Cannot inspect Pi session history; human review is required "
+                f"before continuing: {runtime_dir}"
+            ) from exc
+        current = recovery_dirs[-1] if recovery_dirs else base
+        needs_recovery = False
+        # A newer recovery session cannot authorize continuation past a retained
+        # policy rejection. Check every numbered directory, including the base.
+        for session_dir in [base, *recovery_dirs]:
+            transient_failure = cls._session_needs_transient_recovery(session_dir)
+            if session_dir == current:
+                needs_recovery = transient_failure
+        if not needs_recovery:
+            return current
+        next_index = (
+            int(current.name.removeprefix("pi-sessions-recovery-")) + 1
+            if current != base
+            else 1
+        )
+        return runtime_dir / f"pi-sessions-recovery-{next_index}"
+
+    @classmethod
+    def _session_needs_transient_recovery(cls, session_dir: Path) -> bool:
+        latest_mtime = -1
+        needs_recovery = False
+        try:
+            transcripts = (
+                [path for path in session_dir.iterdir() if path.suffix == ".jsonl"]
+                if session_dir.exists()
+                else []
+            )
+            for transcript in transcripts:
+                modified = transcript.stat().st_mtime_ns
+                size = 0
+                tail = b""
+                with transcript.open("rb") as handle:
+                    while chunk := handle.read(_PI_SESSION_ERROR_SCAN_BYTES):
+                        size += len(chunk)
+                        combined = tail + chunk
+                        # Scan the entire retained history in bounded chunks.
+                        # A later timeout or healthy response does not resolve
+                        # an earlier policy rejection without human review.
+                        if _PI_POLICY_REJECTION in combined:
+                            raise ValueError(
+                                "Pi session contains a provider safety-filter rejection; "
+                                "human review is required before continuing. "
+                                f"Transcript preserved: {transcript}"
+                            )
+                        tail = combined[-_PI_SESSION_ERROR_SCAN_BYTES:]
+                if modified >= latest_mtime:
+                    latest_mtime = modified
+                    error = cls._latest_assistant_error(tail.decode("utf-8", errors="replace"))
+                    needs_recovery = size >= _PI_SESSION_ROLLOVER_MIN_BYTES and any(
+                        marker in error for marker in _PI_TRANSIENT_SESSION_ERRORS
+                    )
+        except OSError as exc:
+            raise ValueError(
+                "Cannot inspect Pi session history; human review is required "
+                f"before continuing: {session_dir}"
+            ) from exc
+        return needs_recovery
+
+    @staticmethod
+    def _latest_assistant_error(tail: str) -> str:
+        terminal_text = ""
+        nonempty_lines = [line for line in tail.splitlines() if line.strip()]
+        for index, line in enumerate(reversed(nonempty_lines)):
+            try:
+                payload = json.loads(line)
+            except (TypeError, ValueError, RecursionError):
+                if index == 0:
+                    terminal_text = line
+                continue
+            if not isinstance(payload, dict) or payload.get("type") != "message":
+                continue
+            message = payload.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            if message.get("stopReason") != "error":
+                return ""
+            error = message.get("errorMessage")
+            return error if isinstance(error, str) else ""
+        # Older transcripts may contain only a plain-text terminal error.
+        return terminal_text
 
     def _render_connector_extension(self, node: NodeSpec) -> str:
         registrations: list[str] = []
