@@ -1165,10 +1165,135 @@ async def test_recover_continues_source_pinned_connector_fanout_in_place(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_runtime_fanout_refresh_rejects_reordered_stable_ids(tmp_path: Path):
-    class ReorderedConnectorManager:
+@pytest.mark.parametrize("prior_count", [9, 99])
+async def test_recover_preserves_connector_members_when_id_padding_grows(
+    tmp_path: Path, prior_count: int
+):
+    values = [f"item-{index}" for index in range(prior_count + 1)]
+
+    class FixtureConnectorManager:
+        def __init__(self):
+            self.bound = []
+
+        async def start(self, _run_id, _pipeline, _run_dir):
+            pass
+
         async def fetch_collection(self, _run_id, _connector, _resource):
-            return ["hunt-second", "hunt-first"]
+            return values
+
+        def bind_member(self, _run_id, node, item_id):
+            self.bound.append((node.id, item_id))
+
+        async def stop(self, _run_id):
+            pass
+
+    orchestrator = _orchestrator(tmp_path)
+    declared = PipelineSpec.model_validate(
+        {
+            "name": "recover-growing-collection",
+            "working_dir": str(tmp_path),
+            "connectors": [
+                {
+                    "name": "fixture",
+                    "url": "http://127.0.0.1:{port}/mcp",
+                    "control_url": "http://127.0.0.1:{port}/orchestration",
+                    "command": "unused",
+                }
+            ],
+            "nodes": [
+                {"id": "source", "agent": "python", "prompt": "print('ready')"},
+                {
+                    "id": "worker",
+                    "agent": "python",
+                    "prompt": "print('{{ fanout.node_id }}:{{ fanout.value }}')",
+                    "depends_on": ["source"],
+                    "connectors": ["fixture"],
+                    "fanout_from": {
+                        "from": "source",
+                        "connector": "fixture",
+                        "resource": "items",
+                    },
+                },
+                {
+                    "id": "collect",
+                    "agent": "python",
+                    "prompt": "print('collected')",
+                    "depends_on": ["worker"],
+                },
+            ],
+        }
+    )
+    execution = declared.model_copy(deep=True)
+    members, prior_ids = expand_runtime_fanout_node(execution.node_map["worker"], values[:-1])
+    execution.nodes.extend(members)
+    execution.fanouts["worker"] = prior_ids
+    record = RunRecord(
+        id=orchestrator.store.new_run_id(),
+        status=RunStatus.RUNNING,
+        pipeline=execution,
+        declared_pipeline=declared,
+        nodes={
+            "source": NodeResult(node_id="source", status=NodeStatus.COMPLETED),
+            "worker": NodeResult(node_id="worker", status=NodeStatus.RUNNING),
+            "collect": NodeResult(node_id="collect", status=NodeStatus.PENDING),
+            **{
+                member.id: NodeResult(
+                    node_id=member.id,
+                    status=NodeStatus.COMPLETED,
+                    success=True,
+                    output=f"durable output for {member.id}",
+                    attempts=[NodeAttempt(number=1, status=NodeStatus.COMPLETED)],
+                )
+                for member in members
+            },
+        },
+    )
+    await orchestrator.store.create_run(record)
+    prior_results = {node_id: record.nodes[node_id].model_dump() for node_id in prior_ids}
+    prior_specs = {member.id: member.model_dump() for member in members}
+    for node_id in prior_ids:
+        await orchestrator.store.write_artifact_text(
+            record.id, node_id, "output.txt", record.nodes[node_id].output
+        )
+    connector_manager = FixtureConnectorManager()
+    orchestrator._connector_manager = connector_manager
+
+    await orchestrator.recover(record.id)
+    completed = await orchestrator.wait(record.id, timeout=5)
+
+    appended_id = f"worker_{prior_count:0{len(str(prior_count + 1))}d}"
+    assert completed.status == RunStatus.COMPLETED
+    assert completed.pipeline.fanouts["worker"] == [*prior_ids, appended_id]
+    assert set(completed.nodes) == {"source", "worker", "collect", *prior_ids, appended_id}
+    for node_id in prior_ids:
+        assert completed.nodes[node_id].model_dump() == prior_results[node_id]
+        assert completed.pipeline.node_map[node_id].model_dump() == prior_specs[node_id]
+        assert orchestrator.store.read_artifact_text(record.id, node_id, "output.txt") == (
+            prior_results[node_id]["output"]
+        )
+    assert completed.nodes[appended_id].output.strip() == f"{appended_id}:{values[-1]}"
+    assert len(completed.nodes[appended_id].attempts) == 1
+    assert connector_manager.bound == list(zip([*prior_ids, appended_id], values))
+    assert json.loads(completed.nodes["worker"].output)["members"] == [*prior_ids, appended_id]
+    assert completed.nodes["collect"].status == NodeStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refreshed_values",
+    [
+        ["hunt-second", "hunt-first"],
+        ["hunt-first"],
+        ["hunt-first", "hunt-replaced"],
+    ],
+    ids=["reordered", "removed", "replaced"],
+)
+async def test_runtime_fanout_refresh_rejects_incompatible_stable_id_prefix(
+    tmp_path: Path, refreshed_values: list[str]
+):
+    class IncompatibleConnectorManager:
+        async def fetch_collection(self, _run_id, _connector, _resource):
+            return refreshed_values
 
     orchestrator = _orchestrator(tmp_path)
     pipeline = PipelineSpec.model_validate(
@@ -1220,15 +1345,20 @@ async def test_runtime_fanout_refresh_rejects_reordered_stable_ids(tmp_path: Pat
         },
     )
     await orchestrator.store.create_run(record)
-    orchestrator._connector_manager = ReorderedConnectorManager()
+    orchestrator._connector_manager = IncompatibleConnectorManager()
+    persisted = record.model_dump()
+    remaining = {"hunt"}
 
     with pytest.raises(ValueError, match="persisted stable ID prefix"):
         await orchestrator._expand_runtime_fanout(
             run_id,
             template,
             node_map=record.pipeline.node_map,
-            remaining={"hunt"},
+            remaining=remaining,
         )
+    assert record.model_dump() == persisted
+    assert remaining == {"hunt"}
+    assert orchestrator.store.get_events(run_id) == []
 
 
 @pytest.mark.asyncio

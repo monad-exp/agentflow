@@ -1799,19 +1799,31 @@ class Orchestrator:
             )
 
         prior_member_ids = record.pipeline.fanouts.get(template.id, [])
-        prior_values = [
-            node_map[member_id].fanout_member.get("value")
-            if member_id in node_map and node_map[member_id].fanout_member is not None
-            else None
-            for member_id in prior_member_ids
-        ]
+        prior_values = []
+        for member_id in prior_member_ids:
+            existing = node_map.get(member_id)
+            if (
+                existing is None
+                or existing.fanout_group != template.id
+                or existing.fanout_member is None
+            ):
+                raise ValueError(
+                    f"runtime fan-out {template.id!r} cannot reconcile persisted member {member_id!r}"
+                )
+            prior_values.append(existing.fanout_member.get("value"))
         if prior_member_ids and values[: len(prior_values)] != prior_values:
             raise ValueError(
                 f"runtime fan-out {template.id!r} no longer preserves its persisted stable ID prefix"
             )
 
         members, member_ids = expand_runtime_fanout_node(template, values)
-        collisions = sorted((set(member_ids) & set(node_map)) - set(prior_member_ids))
+        # The generated ID padding grows with the collection size. Keep each
+        # persisted member and its rendered context intact, and append only the
+        # newly materialized suffix to avoid scheduling completed work again.
+        new_members = members[len(prior_member_ids):]
+        new_member_ids = member_ids[len(prior_member_ids):]
+        member_ids = [*prior_member_ids, *new_member_ids]
+        collisions = sorted(set(new_member_ids) & set(node_map))
         if collisions:
             raise ValueError(
                 f"runtime fan-out {template.id!r} produced node ids that already exist: {collisions}"
@@ -1830,19 +1842,7 @@ class Orchestrator:
             resource=fanout.resource,
             members=member_ids,
         )
-        for index, member in enumerate(members):
-            if member.id in prior_member_ids:
-                existing = node_map.get(member.id)
-                if (
-                    existing is None
-                    or existing.fanout_group != template.id
-                    or existing.fanout_member is None
-                    or existing.fanout_member.get("value") != values[index]
-                ):
-                    raise ValueError(
-                        f"runtime fan-out {template.id!r} cannot reconcile persisted member {member.id!r}"
-                    )
-                continue
+        for index, member in enumerate(new_members, start=len(prior_member_ids)):
             if fanout.connector is not None:
                 self._connector_manager.bind_member(run_id, member, values[index])
             record.pipeline.nodes.append(member)
