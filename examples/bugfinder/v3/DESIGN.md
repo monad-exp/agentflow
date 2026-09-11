@@ -4,6 +4,11 @@ This document is the contract between the modules under `examples/bugfinder/v3/`
 and the small AgentFlow core additions that support them. It is also the
 rationale a reviewer needs. Keep it in sync with the code.
 
+Status: experimental. Preventing agent processes from modifying authoritative
+run state is a prerequisite for promoting this example beyond experimental
+status. Atomic file replacement prevents torn reads but does not provide that
+isolation or establish the authorship of stored results.
+
 ## 1. Decisions
 
 Bugfinder v3 is the Smithers reference topology in
@@ -88,7 +93,8 @@ it off Smithers onto AgentFlow with these decisions:
   receives `AGENTFLOW_RUN_DIR`), so a prompt-injected `read_write` gate agent
   could rewrite another member's `result.json` or `run.json` before a collector
   reads it. Collectors validate shape and cross-member invariants, not
-  authorship; isolating the store from agent processes is outside this port.
+  authorship. This port does not provide that isolation; the boundary remains
+  an open release blocker.
 
 ## 3. Package layout
 

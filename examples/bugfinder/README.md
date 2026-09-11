@@ -91,7 +91,11 @@ an uncertain commit because their narrow tool surfaces cannot fully reconcile
 one. Native mode is rejected until an adapter has a tested native `/goal`
 integration. Timeout, workflow deadline, and retry policy stay in Python.
 
-## Bugfinder v3 (`examples/bugfinder/v3/`)
+## Bugfinder v3 — experimental (`examples/bugfinder/v3/`)
+
+Experimental: writable agent processes share filesystem access with authoritative
+run state. Schema validation checks structure, not who wrote the data. State
+isolation remains unresolved; this example is not ready for production use.
 
 v3 ports the Smithers `bugfinder-v3` security workflow onto AgentFlow without a
 database. Every model node returns one JSON object, which the orchestrator
