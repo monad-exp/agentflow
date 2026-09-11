@@ -25,7 +25,7 @@ class PythonAdapter:
             )
         return PreparedExecution(
             command=[
-                "python3",
+                node.executable or "python3",
                 *(["-I"] if node.connector_bindings else []),
                 "-c",
                 prompt,

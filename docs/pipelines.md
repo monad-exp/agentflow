@@ -60,7 +60,8 @@ Each node supports:
 - local target fields: `cwd`, `bootstrap`, `shell`, `shell_login`, `shell_interactive`, and `shell_init`
 - `capture`: `final` or `trace`
 - `retries` and `retry_backoff_seconds`
-- `success_criteria`: output, filesystem, or completed connector-tool checks evaluated after execution (`connector_tool_called` prevents a polite final response from substituting for a required durable write)
+- `success_criteria`: output, filesystem, JSON Schema, or completed connector-tool checks evaluated after execution (`connector_tool_called` prevents a polite final response from substituting for a required durable write); see [Success criteria](#success-criteria)
+- `executable`: override the CLI binary; for `python` nodes this is the interpreter (default `python3`)
 
 Skill entries are resolved from the pipeline `working_dir`. You can point `skills:` at a plain file, a `.md` file, a home-relative path such as `~/.codex/skills/release-skill`, or a directory that contains `SKILL.md`.
 
@@ -97,6 +98,100 @@ DAG(
     },
 )
 ```
+
+## Success criteria
+
+A node completes only when its process exits `0` and every criterion passes.
+Criteria kinds: `output_contains`, `output_regex`, `file_exists`,
+`file_contains`, `file_nonempty`, `connector_tool_called`,
+`output_json_schema`, and `file_json_schema`. `file_*` paths are relative to
+the pipeline working directory unless stated otherwise.
+
+`output_json_schema` validates the node's final response as JSON against a
+Draft 2020-12 schema. The response is parsed as a whole, then as the last
+fenced ```` ```json ```` block, then as the last object or array that runs to the
+end of the text. The parsed value is stored as `structured_output` in
+`artifacts/<node>/result.json` and is what `fanout_from` reads.
+
+```json
+{
+  "kind": "output_json_schema",
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["rankedFiles"],
+    "properties": {
+      "rankedFiles": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["path", "score"],
+          "properties": {"path": {"type": "string"}, "score": {"type": "integer", "minimum": 1, "maximum": 5}}
+        }
+      }
+    }
+  }
+}
+```
+
+`file_json_schema` validates a JSON file the node wrote. `root` is `runtime`
+(default: the node's `runtime/<node>` directory, `$AGENTFLOW_RUNTIME_DIR`) or
+`workdir`. With `modified_in_attempt` (default `true`) the file's mtime must
+not predate the attempt start, so a file left behind by an earlier attempt
+does not count.
+
+```json
+{
+  "kind": "file_json_schema",
+  "path": "plan.json",
+  "root": "runtime",
+  "modified_in_attempt": true,
+  "schema": {"type": "object", "required": ["lanes"], "properties": {"lanes": {"type": "object"}}}
+}
+```
+
+Both schemas are checked for validity when the pipeline loads. Failure
+messages list every violation as `<json pointer>: <message>` (sorted, at most
+20), for example
+`output_json_schema=False: 1 error(s): /rankedFiles/0/score: 9 is greater than the maximum of 5`.
+
+### Retry feedback
+
+When a model node (`codex`, `claude`, `kimi`, or `pi`) retries after an attempt
+whose criteria failed, the retry prompt ends with the failed lines of the
+previous attempt (lines ending in `=True` are omitted, the list is capped at
+2000 characters). Only in-loop retries get this suffix: the attempt that
+process recovery or `rerun` starts after a cancelled attempt receives the
+unmodified prompt. Utility nodes (`python`, `shell`, and `sync`) keep their
+original executable source or mode on retry.
+
+```text
+AgentFlow previous attempt did not meet its success criteria:
+- output_json_schema=False: 1 error(s): /count: 'many' is not of type 'integer'
+```
+
+## Run identity
+
+Every node process receives these environment variables; they override any
+same-named key in `node.env` and are never written back to the stored spec:
+
+| Variable | Value |
+| --- | --- |
+| `AGENTFLOW_RUN_ID` | the run id |
+| `AGENTFLOW_RUN_DIR` | host path of `<runs>/<run>` (holds `run.json` and `artifacts/`; reachable from local targets) |
+| `AGENTFLOW_NODE_ID` | the executing node id (fan-out members get their member id) |
+| `AGENTFLOW_RUNTIME_DIR` | the node's `runtime/<node>` directory as seen by the process |
+
+Trusted `python` collectors use these to read `run.json` and
+`artifacts/<node>/result.json` instead of receiving agent output through Jinja.
+
+Prompts see the same paths through the render context: `run.id`,
+`run.directory`, `run.artifacts_directory`, `run.runtime_directory`, and
+`nodes.<id>.artifacts.runtime_dir` next to the existing
+`nodes.<id>.artifacts.{directory,stdout_log,stderr_log,trace_jsonl,output_txt,result_json,launch_json}`.
+`run` is present whenever a prompt is rendered for a real run (not in `inspect`
+previews). `resume` copies `artifacts/<node>` and `runtime/<node>` of every
+completed node into the new run so these paths stay valid.
 
 ## Graph optimization rounds
 
@@ -212,6 +307,22 @@ provider-neutral resume: the next attempt re-reads connector state and reuses
 idempotency keys. Built-in adapters reject `mode="native"` until an adapter has
 a tested native durable-goal lifecycle; AgentFlow does not simulate it with a
 prompt prefix.
+
+For local Pi nodes, supervised retries retain their transcripts under the
+node's `pi-sessions` runtime directory. A transcript of at least 2 MiB ending
+in `Upstream idle timeout exceeded` or `Provider finish_reason: error` can
+continue in a numbered `pi-sessions-recovery-N` directory. Small sessions,
+unknown errors, and sessions with a later healthy assistant response keep
+their current directory. Existing recovery directories are selected by number.
+
+Before preparing a local Pi attempt, AgentFlow checks every retained base and
+recovery transcript for the provider marker
+`Request blocked: prompt injection patterns detected`. Any occurrence stops
+preparation with a human-review error, even if a later timeout or healthy
+session exists. A session read failure also stops preparation. These checks
+preserve all transcript files; a timeout or new recovery directory cannot
+clear a policy rejection. This adapter check does not inspect transcripts on
+remote targets, whose existing session behavior is unchanged.
 
 Named `concurrency_pools` cap shared providers without reducing unrelated work:
 

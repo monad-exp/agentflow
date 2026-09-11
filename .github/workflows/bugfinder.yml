@@ -18,6 +18,7 @@ jobs:
           pytest -q
           tests/test_agents.py
           tests/test_context.py
+          tests/test_contracts.py
           tests/test_dsl.py
           tests/test_loader.py
           tests/test_orchestrator.py
@@ -30,6 +31,12 @@ jobs:
           tests/test_traces.py
           tests/test_connectors.py
           tests/test_utility_agents.py
+      - name: Inspect JSON compatibility
+        run: >-
+          pytest -q
+          tests/test_cli.py::test_inspect_command_supports_json_output_and_redacts_env
+          tests/test_cli.py::test_inspect_command_resolves_default_kimi_provider_in_json
+          tests/test_cli.py::test_inspect_command_serializes_optional_provider_capabilities
 
   postgres:
     runs-on: ubuntu-latest

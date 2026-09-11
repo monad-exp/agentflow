@@ -90,6 +90,21 @@ _TRANSIENT_TRACE_KINDS = {
 }
 
 
+SUCCESS_FEEDBACK_MAX_CHARS = 2000
+
+
+def _previous_attempt_feedback(previous: NodeAttempt) -> str:
+    """Tell a retry which success criteria the previous attempt missed."""
+
+    if previous.success is not False:
+        return ""
+    failed = [line for line in previous.success_details if not line.endswith("=True")]
+    if not failed:
+        return ""
+    body = "\n- ".join(failed)[:SUCCESS_FEEDBACK_MAX_CHARS]
+    return f"\n\nAgentFlow previous attempt did not meet its success criteria:\n- {body}"
+
+
 def _materialize_connector_mcps(node: Any) -> Any:
     """Create the adapter-only MCP view of run-scoped connector bindings."""
 
@@ -896,16 +911,21 @@ class Orchestrator:
         if old_sb.exists():
             shutil.copy2(str(old_sb), str(new_run_dir / SCRATCHBOARD_FILENAME))
 
-        # Copy artifacts for completed nodes
-        old_artifacts = old_run_dir / "artifacts"
-        new_artifacts = new_run_dir / "artifacts"
+        # Copy artifacts and runtime state for completed nodes. Runtime dirs may
+        # hold symlinks to host credential files; keep them as links so no
+        # secret is duplicated into the run store.
         for node_id, node_result in nodes.items():
-            if node_result.status == NodeStatus.COMPLETED:
-                src = old_artifacts / node_id
+            if node_result.status != NodeStatus.COMPLETED:
+                continue
+            for subdir in ("artifacts", "runtime"):
+                src = old_run_dir / subdir / node_id
                 if src.is_dir():
-                    dst = new_artifacts / node_id
-                    dst.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(str(src), str(dst), dirs_exist_ok=True)
+                    shutil.copytree(
+                        str(src),
+                        str(new_run_dir / subdir / node_id),
+                        symlinks=True,
+                        dirs_exist_ok=True,
+                    )
 
         await self._publish(new_run_id, "run_queued", pipeline=pipeline.model_dump(mode="json"),
                             resumed_from=run_id)
@@ -1449,6 +1469,15 @@ class Orchestrator:
             )
         runner = self.runners.get(execution_node.target.kind)
         adapter_node = _materialize_connector_mcps(execution_node)
+        # Run identity for the node process only; never written back to the
+        # stored spec, and not a connector secret so the runner keeps it.
+        adapter_node.env = {
+            **adapter_node.env,
+            "AGENTFLOW_RUN_ID": run_id,
+            "AGENTFLOW_RUN_DIR": str(self.store.run_dir(run_id).resolve()),
+            "AGENTFLOW_NODE_ID": node_id,
+            "AGENTFLOW_RUNTIME_DIR": paths.target_runtime_dir,
+        }
         parser = create_trace_parser(runtime_agent, node.id)
         periodic_actions: _PeriodicActionEnvelope | None = None
         periodic_action_parse_error: str | None = None
@@ -1485,6 +1514,16 @@ class Orchestrator:
                     "analysis and tool use concise, persist useful progress incrementally, and call "
                     "the required durable completion tool before reaching the response limit."
                 )
+            # Conversational feedback belongs only in model prompts: utility
+            # adapters interpret their prompt as executable source or a mode.
+            # Only in-loop retries follow evaluated attempts; recovery after
+            # cancellation receives the original prompt.
+            if (
+                runtime_agent in {AgentKind.CODEX, AgentKind.CLAUDE, AgentKind.KIMI, AgentKind.PI}
+                and retry_index > 0
+                and result.attempts[-2].status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT}
+            ):
+                attempt_prompt += _previous_attempt_feedback(result.attempts[-2])
             prepared = adapter.prepare(adapter_node, attempt_prompt, paths)
             # Forward local credentials to remote targets when enabled
             # EC2/ECS: always forward (ephemeral, no pre-existing config)
@@ -1587,7 +1626,13 @@ class Orchestrator:
             structured_output, structured_error = parse_json_output(result.output or result.final_response)
             if structured_error is None:
                 result.structured_output = structured_output
-            success_ok, success_details = evaluate_success(execution_node, result, paths.host_workdir)
+            success_ok, success_details = evaluate_success(
+                execution_node,
+                result,
+                paths.host_workdir,
+                runtime_dir=paths.host_runtime_dir,
+                attempt_started_at=attempt.started_at,
+            )
             result.success = success_ok
             result.success_details = success_details
             attempt.finished_at = utcnow_iso()
@@ -1798,8 +1843,32 @@ class Orchestrator:
                 f"connector-backed runtime fan-out {template.id!r} returned duplicate stable IDs"
             )
 
+        prior_member_ids = record.pipeline.fanouts.get(template.id, [])
+        prior_values = []
+        for member_id in prior_member_ids:
+            existing = node_map.get(member_id)
+            if (
+                existing is None
+                or existing.fanout_group != template.id
+                or existing.fanout_member is None
+            ):
+                raise ValueError(
+                    f"runtime fan-out {template.id!r} cannot reconcile persisted member {member_id!r}"
+                )
+            prior_values.append(existing.fanout_member.get("value"))
+        if prior_member_ids and values[: len(prior_values)] != prior_values:
+            raise ValueError(
+                f"runtime fan-out {template.id!r} no longer preserves its persisted stable ID prefix"
+            )
+
         members, member_ids = expand_runtime_fanout_node(template, values)
-        collisions = sorted(set(member_ids) & set(node_map))
+        # The generated ID padding grows with the collection size. Keep each
+        # persisted member and its rendered context intact, and append only the
+        # newly materialized suffix to avoid scheduling completed work again.
+        new_members = members[len(prior_member_ids):]
+        new_member_ids = member_ids[len(prior_member_ids):]
+        member_ids = [*prior_member_ids, *new_member_ids]
+        collisions = sorted(set(new_member_ids) & set(node_map))
         if collisions:
             raise ValueError(
                 f"runtime fan-out {template.id!r} produced node ids that already exist: {collisions}"
@@ -1818,7 +1887,7 @@ class Orchestrator:
             resource=fanout.resource,
             members=member_ids,
         )
-        for index, member in enumerate(members):
+        for index, member in enumerate(new_members, start=len(prior_member_ids)):
             if fanout.connector is not None:
                 self._connector_manager.bind_member(run_id, member, values[index])
             record.pipeline.nodes.append(member)
@@ -2005,7 +2074,11 @@ class Orchestrator:
             for node_id, node in node_map.items()
             if node.fanout_from is not None
         }
-        runtime_expanded = set(record.pipeline.fanouts) & set(runtime_templates)
+        runtime_expanded = {
+            template_id
+            for template_id in set(record.pipeline.fanouts) & set(runtime_templates)
+            if record.nodes[template_id].status == NodeStatus.COMPLETED
+        }
         remaining.difference_update(runtime_expanded)
         pool_semaphores = {
             name: asyncio.Semaphore(limit)
