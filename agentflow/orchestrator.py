@@ -1514,10 +1514,15 @@ class Orchestrator:
                     "analysis and tool use concise, persist useful progress incrementally, and call "
                     "the required durable completion tool before reaching the response limit."
                 )
-            # Only an in-loop retry follows an attempt whose criteria were
-            # evaluated; a recovered or rerun attempt after a cancelled one is
-            # not a retry and gets the unmodified prompt.
-            if retry_index > 0 and result.attempts[-2].status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT}:
+            # Conversational feedback belongs only in model prompts: utility
+            # adapters interpret their prompt as executable source or a mode.
+            # Only in-loop retries follow evaluated attempts; recovery after
+            # cancellation receives the original prompt.
+            if (
+                runtime_agent in {AgentKind.CODEX, AgentKind.CLAUDE, AgentKind.KIMI, AgentKind.PI}
+                and retry_index > 0
+                and result.attempts[-2].status in {NodeStatus.FAILED, NodeStatus.TIMED_OUT}
+            ):
                 attempt_prompt += _previous_attempt_feedback(result.attempts[-2])
             prepared = adapter.prepare(adapter_node, attempt_prompt, paths)
             # Forward local credentials to remote targets when enabled
