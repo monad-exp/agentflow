@@ -75,15 +75,23 @@ def role_agent(config: BugfinderConfig, role: str, **kwargs: Any):
         raise ValueError(f"unsupported {role} agent {selected!r}; choose codex, claude, or pi")
     kwargs.setdefault("connectors", ["bugdb"])
     kwargs.setdefault("concurrency_pool", f"{selected}-provider")
-    if role in {"hunt", "deduplicate"}:
+    connector_roles = {
+        "rank",
+        "threat",
+        "roam",
+        "hunt",
+        "deduplicate",
+        "triage",
+        "rereview",
+    }
+    if role in connector_roles:
         kwargs.setdefault(
             "durable_goal",
             {"mode": config.setting("BUGFINDER_GOAL_MODE", "supervised")},
         )
-    retryable = role in {"hunt", "deduplicate", "triage", "rereview"}
     kwargs.setdefault(
         "retries",
-        int(config.setting("BUGFINDER_RETRIES", "1")) if retryable else 0,
+        int(config.setting("BUGFINDER_RETRIES", "1")) if role in connector_roles else 0,
     )
     kwargs.setdefault("retry_backoff_seconds", 2)
     kwargs.setdefault("timeout_seconds", int(config.setting("BUGFINDER_NODE_TIMEOUT", "1800")))
