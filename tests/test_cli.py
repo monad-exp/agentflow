@@ -1020,6 +1020,56 @@ def test_inspect_command_supports_json_output_and_redacts_env(tmp_path, monkeypa
     assert payload["nodes"][0]["launch"]["env"]["ANTHROPIC_BASE_URL"] == "https://api.kimi.com/coding/"
 
 
+@pytest.mark.parametrize(
+    ("capabilities", "expected_capabilities"),
+    [
+        ({}, {}),
+        ({"model_reasoning": None, "model_context_window": None, "model_max_tokens": None}, {}),
+        ({"model_reasoning": False}, {"model_reasoning": False}),
+        (
+            {"model_reasoning": True, "model_context_window": 262144, "model_max_tokens": 32768},
+            {"model_reasoning": True, "model_context_window": 262144, "model_max_tokens": 32768},
+        ),
+    ],
+)
+def test_inspect_command_serializes_optional_provider_capabilities(tmp_path, capabilities, expected_capabilities):
+    pipeline_path = tmp_path / "pipeline.json"
+    pipeline_path.write_text(
+        json.dumps(
+            {
+                "name": "inspect-provider-capabilities",
+                "working_dir": ".",
+                "nodes": [
+                    {
+                        "id": "answer",
+                        "agent": "pi",
+                        "prompt": "Say hello",
+                        "model": "custom/example-model",
+                        "provider": {"name": "custom", "base_url": "https://example.com/v1", **capabilities},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["inspect", str(pipeline_path), "--output", "json"])
+
+    assert result.exit_code == 0
+    node = json.loads(result.stdout)["nodes"][0]
+    expected_provider = {
+        "name": "custom",
+        "base_url": "https://example.com/v1",
+        "api_key_env": None,
+        "wire_api": None,
+        "headers": {},
+        "env": {},
+        **expected_capabilities,
+    }
+    assert node["provider"] == expected_provider
+    assert node["resolved_provider"] == expected_provider
+
+
 def test_inspect_command_supports_json_summary_output(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()

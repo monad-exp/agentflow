@@ -51,6 +51,10 @@ agentflow inspect examples/pipeline.yaml
 agentflow inspect examples/codex-repo-sweep-batched.yaml --output summary
 ```
 
+In `inspect --output json`, `provider` and `resolved_provider` include the optional
+`model_reasoning`, `model_context_window`, and `model_max_tokens` fields only when
+their values are non-null. An explicit `model_reasoning: false` is preserved.
+
 ## Run
 
 Run a pipeline once:
