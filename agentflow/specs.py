@@ -125,6 +125,9 @@ class ProviderConfig(BaseModel):
     wire_api: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
+    model_reasoning: bool | None = None
+    model_context_window: int | None = Field(default=None, gt=0)
+    model_max_tokens: int | None = Field(default=None, gt=0)
 
 
 class InferenceSetupSpec(BaseModel):

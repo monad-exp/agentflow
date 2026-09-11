@@ -293,16 +293,26 @@ export async function createFindings(
     const leads = await tx.lead.findMany({
       where: { hunt: { runId: scope.runId } },
     });
+    const requestFindingIds = new Set(ids);
+    const requiredLeadIds = leads
+      .filter((lead) => lead.findingId === null || requestFindingIds.has(lead.findingId))
+      .map((lead) => lead.id);
     const durableLeadIds = leads.map((lead) => lead.id);
-    if (!sameStringSet(durableLeadIds, allLeadIds)) {
+    if (!sameStringSet(requiredLeadIds, allLeadIds)) {
       const durableLeadIdSet = new Set(durableLeadIds);
       const submittedLeadIdSet = new Set(allLeadIds);
-      const missingLeadIds = durableLeadIds.filter((id) => !submittedLeadIdSet.has(id));
+      const requiredLeadIdSet = new Set(requiredLeadIds);
+      const missingLeadIds = requiredLeadIds.filter((id) => !submittedLeadIdSet.has(id));
       const unknownLeadIds = allLeadIds.filter((id) => !durableLeadIdSet.has(id));
+      const assignedLeadIds = allLeadIds.filter((id) => durableLeadIdSet.has(id) && !requiredLeadIdSet.has(id));
       throw new Error(
-        "Finding input must partition every Lead in this AgentFlow run exactly once; " +
+        "Finding input must partition every Lead currently unassigned exactly once and fully replay " +
+        "the membership of each requested existing Finding; " +
         `${leadIdDiagnostic("missing Lead IDs", missingLeadIds)}; ` +
-        leadIdDiagnostic("unknown Lead IDs", unknownLeadIds),
+        leadIdDiagnostic("unknown Lead IDs", unknownLeadIds) +
+        (assignedLeadIds.length > 0
+          ? `; ${leadIdDiagnostic("Lead IDs already assigned to another Finding", assignedLeadIds)}`
+          : ""),
       );
     }
     for (const [index, finding] of input.findings.entries()) {
